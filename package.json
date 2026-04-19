@@ -1,0 +1,48 @@
+{
+  "name": "hindsight-pi",
+  "version": "0.1.0",
+  "description": "Hindsight-backed persistent memory extension for pi",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi", "hindsight", "memory", "extension"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/walodayeet/pi-hindsight.git"
+  },
+  "homepage": "https://github.com/walodayeet/pi-hindsight#readme",
+  "bugs": {
+    "url": "https://github.com/walodayeet/pi-hindsight/issues"
+  },
+  "files": [
+    "extensions",
+    "docs",
+    "types",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "smoke": "node tests/smoke-client.mjs"
+  },
+  "dependencies": {
+    "@vectorize-io/hindsight-client": "^0.4.19"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.2"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
