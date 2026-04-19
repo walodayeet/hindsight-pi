@@ -72,8 +72,10 @@ interface RetainItem {
 
 interface PendingWrite {
   handles: HindsightHandles;
+  bankId: string;
   items: RetainItem[];
   summary: RetainSummary;
+  notify: boolean;
 }
 
 export interface RetainSummary {
@@ -88,6 +90,15 @@ export interface DeliveredRetainNotice {
 }
 
 const isConversationMessage = (message: any): boolean => message?.role === "user" || message?.role === "assistant";
+
+const latestUserText = (messages: any[]): string => {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === "user") return extractText(messages[i]?.content);
+  }
+  return "";
+};
+
+const shouldRetainToGlobalBank = (messages: any[]): boolean => /(^|\s)#(global|me)(?=\s|$)/i.test(latestUserText(messages));
 
 const buildTurnSummary = (messages: any[]): string => {
   const userParts: string[] = [];
@@ -107,7 +118,7 @@ const buildTurnSummary = (messages: any[]): string => {
   return sections.join("\n\n").trim();
 };
 
-const toRetainItems = (handles: HindsightHandles, messages: any[]): RetainItem[] => {
+const toRetainItems = (handles: HindsightHandles, messages: any[], bankId = handles.bankId): RetainItem[] => {
   const summary = buildTurnSummary(messages);
   if (!summary) return [];
   const chunks = chunkTextSmart(summary, handles.config.maxMessageLength);
@@ -116,7 +127,7 @@ const toRetainItems = (handles: HindsightHandles, messages: any[]): RetainItem[]
     metadata: {
       source: "pi",
       kind: "turn-summary",
-      bankId: handles.bankId,
+      bankId,
       workspace: handles.config.workspace,
     },
     timestamp: new Date(),
@@ -139,21 +150,21 @@ export class WriteScheduler {
     private onDelivered?: (notice: DeliveredRetainNotice) => void | Promise<void>,
   ) {}
 
-  private async sendWithRetry(handles: HindsightHandles, items: RetainItem[]): Promise<void> {
+  private async sendWithRetry(handles: HindsightHandles, bankId: string, items: RetainItem[]): Promise<void> {
     try {
       if (items.length === 1) {
         const [item] = items;
-        await handles.client.retain(handles.bankId, item.content, item);
+        await handles.client.retain(bankId, item.content, item);
       } else {
-        await handles.client.retainBatch(handles.bankId, items, { async: false });
+        await handles.client.retainBatch(bankId, items, { async: false });
       }
     } catch (firstError) {
       await new Promise((r) => setTimeout(r, 1500));
       if (items.length === 1) {
         const [item] = items;
-        await handles.client.retain(handles.bankId, item.content, item);
+        await handles.client.retain(bankId, item.content, item);
       } else {
-        await handles.client.retainBatch(handles.bankId, items, { async: false });
+        await handles.client.retainBatch(bankId, items, { async: false });
       }
       if (handles.config.logging) {
         console.warn("[hindsight-pi] upload retried after error:", firstError instanceof Error ? firstError.message : firstError);
@@ -164,11 +175,13 @@ export class WriteScheduler {
   private enqueueAsync(write: PendingWrite): void {
     this.asyncQueue = this.asyncQueue
       .then(async () => {
-        await this.sendWithRetry(write.handles, write.items);
-        await this.onDelivered?.({
-          handles: write.handles,
-          summary: { ...write.summary, mode: "saved" },
-        });
+        await this.sendWithRetry(write.handles, write.bankId, write.items);
+        if (write.notify) {
+          await this.onDelivered?.({
+            handles: write.handles,
+            summary: { ...write.summary, mode: "saved" },
+          });
+        }
       })
       .catch((error) => {
         console.error("[hindsight-pi] upload queue error:", error instanceof Error ? error.message : error);
@@ -176,26 +189,35 @@ export class WriteScheduler {
   }
 
   async onTurnEnd(handles: HindsightHandles, messages: any[]): Promise<RetainSummary | null> {
-    const items = toRetainItems(handles, messages);
-    if (items.length === 0) return null;
+    const bankIds = [handles.bankId];
+    if (handles.config.globalBankId && handles.config.globalBankId !== handles.bankId && shouldRetainToGlobalBank(messages)) {
+      bankIds.push(handles.config.globalBankId);
+    }
+
+    const writes = bankIds
+      .map((bankId) => ({ bankId, items: toRetainItems(handles, messages, bankId) }))
+      .filter((entry) => entry.items.length > 0);
+    if (writes.length === 0) return null;
 
     const summary: RetainSummary = {
       mode: "saved",
-      itemsCount: items.length,
-      previews: previewItems(items),
+      itemsCount: writes.reduce((count, entry) => count + entry.items.length, 0),
+      previews: previewItems(writes[0]?.items ?? []),
     };
 
     this.turnCount += 1;
     if (this.frequency === "async") {
       summary.mode = "queued";
-      this.enqueueAsync({ handles, items, summary });
+      writes.forEach((write, index) => {
+        this.enqueueAsync({ handles, bankId: write.bankId, items: write.items, summary, notify: index === 0 });
+      });
       return summary;
     }
     if (this.frequency === "turn") {
-      await this.sendWithRetry(handles, items);
+      for (const write of writes) await this.sendWithRetry(handles, write.bankId, write.items);
       return summary;
     }
-    this.pending.push({ handles, items, summary: { ...summary } });
+    this.pending.push(...writes.map((write, index) => ({ handles, bankId: write.bankId, items: write.items, summary: { ...summary }, notify: index === 0 })));
     if (typeof this.frequency === "number") {
       if (this.turnCount % this.frequency === 0) {
         await this.flushPending();
@@ -213,8 +235,8 @@ export class WriteScheduler {
   private async flushPending(): Promise<void> {
     const batch = this.pending.splice(0);
     for (const write of batch) {
-      await this.sendWithRetry(write.handles, write.items);
-      if (write.summary.mode === "queued") {
+      await this.sendWithRetry(write.handles, write.bankId, write.items);
+      if (write.notify && write.summary.mode === "queued") {
         await this.onDelivered?.({
           handles: write.handles,
           summary: { ...write.summary, mode: "saved" },

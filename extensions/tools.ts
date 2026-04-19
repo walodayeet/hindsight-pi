@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { ensureBank, getBankInsights, getHandles } from "./client.js";
+import { ensureBank, getBankInsights, getHandles, type HindsightHandles } from "./client.js";
 import { getRecallMode, type ReasoningLevel, type SearchBudget } from "./config.js";
 
 const LEVELS: readonly ReasoningLevel[] = ["low", "medium", "high"];
@@ -25,10 +25,18 @@ const dynamicBudget = (query: string, baseLevel: ReasoningLevel, dynamic: boolea
   return LEVEL_TO_BUDGET[level];
 };
 
+const activeBankIds = (handles: HindsightHandles): string[] => {
+  const ids = [handles.bankId, handles.config.globalBankId].filter((value): value is string => Boolean(value));
+  return [...new Set(ids)];
+};
+
 const ensureHandles = async () => {
   const handles = getHandles();
   if (!handles) throw new Error("Hindsight is not connected. Run /hindsight:setup first.");
   await ensureBank(handles.client, handles.bankId, handles.config);
+  if (handles.config.globalBankId && handles.config.globalBankId !== handles.bankId) {
+    await ensureBank(handles.client, handles.config.globalBankId, handles.config);
+  }
   return handles;
 };
 
@@ -54,17 +62,22 @@ export const registerTools = (pi: ExtensionAPI): void => {
       if (getRecallMode() === "off") throw new Error("Hindsight memory is disabled.");
       const handles = await ensureHandles();
       const results: Array<{ text?: string; type?: string; sourceHost?: string }> = [];
-      const main = await handles.client.recall(handles.bankId, params.query, {
-        budget: params.budget ?? handles.config.searchBudget,
-        maxTokens: Math.max(handles.config.contextTokens * 2, 512),
-      });
-      results.push(...(main?.results ?? []).map((r: any) => ({ ...r, sourceHost: handles.config.workspace })));
+      for (const bankId of activeBankIds(handles)) {
+        const main = await handles.client.recall(bankId, params.query, {
+          budget: params.budget ?? handles.config.searchBudget,
+          maxTokens: Math.max(handles.config.contextTokens * 2, 512),
+          types: handles.config.recallTypes,
+        });
+        const sourceHost = bankId === handles.bankId ? handles.config.workspace : `${handles.config.workspace}:global`;
+        results.push(...(main?.results ?? []).map((r: any) => ({ ...r, sourceHost })));
+      }
 
       for (const linked of handles.linked) {
         try {
           const hostResult = await linked.client.recall(linked.bankId, params.query, {
             budget: params.budget ?? handles.config.searchBudget,
             maxTokens: Math.max(handles.config.contextTokens * 2, 512),
+            types: handles.config.recallTypes,
           });
           results.push(...(hostResult?.results ?? []).map((r: any) => ({ ...r, sourceHost: linked.name })));
         } catch (error) {
@@ -101,11 +114,14 @@ export const registerTools = (pi: ExtensionAPI): void => {
       );
 
       const sections: string[] = [];
-      const primary = await handles.client.reflect(handles.bankId, params.query, {
-        context: params.context,
-        budget,
-      });
-      sections.push(`=== [${handles.config.workspace}] ===\n${primary?.text ?? "No synthesized context returned."}`);
+      for (const bankId of activeBankIds(handles)) {
+        const primary = await handles.client.reflect(bankId, params.query, {
+          context: params.context,
+          budget,
+        });
+        const label = bankId === handles.bankId ? handles.config.workspace : `${handles.config.workspace}:global`;
+        sections.push(`=== [${label}] ===\n${primary?.text ?? "No synthesized context returned."}`);
+      }
 
       for (const linked of handles.linked) {
         try {
@@ -178,9 +194,11 @@ export const registerTools = (pi: ExtensionAPI): void => {
         `Documents: ${insights.documentsCount ?? "unknown"}`,
         `Entities: ${insights.entitiesCount ?? "unknown"}`,
         `Workspace: ${handles.config.workspace}`,
+        `Global bank: ${handles.config.globalBankId ?? "none"}`,
         `Linked hosts: ${linked}`,
         `Base URL: ${handles.config.baseUrl}`,
         `Recall mode: ${handles.config.recallMode}`,
+        `Recall types: ${handles.config.recallTypes.join(", ")}`,
       ].join("\n");
       return {
         content: [{ type: "text", text }],

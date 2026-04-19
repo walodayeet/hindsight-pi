@@ -1,6 +1,6 @@
 {
-  "name": "hindsight-pi",
-  "version": "0.1.0",
+  "name": "@walodayeet/hindsight-pi",
+  "version": "0.1.2",
   "description": "Hindsight-backed persistent memory extension for pi",
   "type": "module",
   "license": "MIT",
@@ -23,7 +23,8 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "smoke": "node tests/smoke-client.mjs"
+    "smoke": "node tests/smoke-client.mjs",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "dependencies": {
     "@vectorize-io/hindsight-client": "^0.4.19"
@@ -36,6 +37,14 @@
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@mariozechner/pi-coding-agent": {
+      "optional": true
+    },
+    "@sinclair/typebox": {
+      "optional": true
+    }
   },
   "pi": {
     "extensions": [

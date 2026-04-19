@@ -70,7 +70,7 @@ pi -e ./extensions/index.ts
 Install as pi package from npm:
 
 ```bash
-pi install npm:hindsight-pi
+pi install npm:@walodayeet/hindsight-pi
 ```
 
 Install as pi package from git:
@@ -85,12 +85,18 @@ Create `~/.hindsight/config.json`:
 
 ```json
 {
+  "apiKey": "your-key",
   "baseUrl": "http://192.168.9.24:8888",
   "bankStrategy": "per-repo",
+  "bankId": "optional-manual-bank",
+  "globalBankId": "optional-global-bank",
+  "recallTypes": ["observation"],
   "host": {
     "pi": {
       "enabled": true,
+      "workspace": "pi",
       "recallMode": "hybrid",
+      "recallTypes": ["observation"],
       "autoCreateBank": true,
       "contextTokens": 1200,
       "contextRefreshTtlSeconds": 300,
@@ -101,21 +107,33 @@ Create `~/.hindsight/config.json`:
       "saveMessages": true,
       "searchBudget": "mid",
       "reflectBudget": "low",
+      "dialecticDynamic": true,
+      "reasoningLevel": "low",
+      "reasoningLevelCap": "medium",
       "toolPreviewLength": 500,
       "maxMessageLength": 25000,
+      "showRecallIndicator": true,
+      "showRetainIndicator": true,
+      "indicatorsInContext": false,
       "logging": true
     }
+  },
+  "mappings": {
+    "/abs/path/to/project": "manual-bank-id"
   }
 }
 ```
 
-If your Hindsight deployment requires auth, add:
+Compat aliases from `pi-hindsight` also accepted in same file:
+- `api_url` -> `baseUrl`
+- `api_key` -> `apiKey`
+- `bank_id` -> `bankId`
+- `global_bank` -> `globalBankId`
+- `recall_types` -> `recallTypes`
 
-```json
-{
-  "apiKey": "your-key"
-}
-```
+Project-local override also supported:
+- `.hindsight/config.json`
+- local values override global values
 
 Alternative interactive setup once loaded in pi:
 
@@ -175,7 +193,7 @@ Publish to npm:
 
 ```bash
 npm login
-npm publish
+npm publish --access public
 ```
 
 Push repo to GitHub:
@@ -190,13 +208,20 @@ git push -u origin master
 Package gallery notes:
 - package includes `pi-package` keyword for discovery
 - `pi.dev/packages` indexes npm packages and git-installable pi packages
-- after publish, install with `pi install npm:hindsight-pi`
+- after publish, install with `pi install npm:@walodayeet/hindsight-pi`
 
-## Known Gaps Before Broader Release
+## Release Readiness
 
-Still worth improving:
+Ready for publish:
+- typecheck passes
+- tests pass
+- npm tarball verified with `npm pack --dry-run`
+- config contract covers global + local `config.json`
+- `pi-hindsight` compat aliases supported
+- taskplane artifacts ignored from publish/repo flow
+
+Future enhancements, not release blockers:
 - richer doctor/status diagnostics
 - stronger SDK typing instead of local shims
 - more selective upload summarization for noisy tool-heavy sessions
 - optional mental-model support
-- package publishing/install polish for global pi package workflows

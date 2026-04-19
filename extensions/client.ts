@@ -102,6 +102,9 @@ export const bootstrap = async (config: HindsightConfig, cwd: string): Promise<H
   const client = buildClient(config.baseUrl, config.apiKey);
   const bankId = await deriveBankId(cwd, config.bankStrategy, config);
   await ensureBank(client, bankId, config);
+  if (config.globalBankId && config.globalBankId !== bankId) {
+    await ensureBank(client, config.globalBankId, config);
+  }
 
   const linked: LinkedHostHandle[] = [];
   for (const linkedConfig of config.linkedHostConfigs) {

@@ -5,9 +5,11 @@ import {
   type BankStrategy,
   type RecallMode,
   type ReasoningLevel,
+  type RecallType,
   normalizeBankStrategy,
   normalizeRecallMode,
   normalizeReasoningLevel,
+  normalizeRecallTypes,
   resolveConfig,
   saveConfig,
   setRecallMode,
@@ -25,17 +27,23 @@ const parseBool = (value: string | undefined, fallback: boolean): boolean => {
   if (value === "false") return false;
   return fallback;
 };
+const parseWriteFrequency = (value: string | undefined, fallback: number | "async" | "turn" | "session") => {
+  const parsed = Number(value);
+  if (Number.isInteger(parsed) && parsed > 0) return parsed;
+  if (value === "async" || value === "turn" || value === "session") return value;
+  return fallback;
+};
 
 const connect = async (ctx: ExtensionContext): Promise<void> => {
   clearHandles();
-  const config = await resolveConfig();
+  const config = await resolveConfig(ctx.cwd);
   if (!config.enabled) throw new Error("Hindsight is disabled.");
   const handles = await bootstrap(config, ctx.cwd);
   await refreshCachedContext(handles);
 };
 
 const statusText = async (ctx: ExtensionContext): Promise<string> => {
-  const config = await resolveConfig();
+  const config = await resolveConfig(ctx.cwd);
   const handles = getHandles();
   const bankId = handles?.bankId ?? await deriveBankId(ctx.cwd, config.bankStrategy, config);
   const cache = renderCachedContext();
@@ -56,6 +64,7 @@ const statusText = async (ctx: ExtensionContext): Promise<string> => {
     `Connected: ${handles ? "yes" : "no"}`,
     `Base URL: ${config.baseUrl}`,
     `Active bank: ${bankId} (${bankSource})`,
+    `Global bank: ${config.globalBankId ?? "(none)"}`,
     `Bank name: ${insights.profile?.name ?? bankId}`,
     `Bank background: ${insights.profile?.background ?? ""}`,
     `Disposition: ${disposition}`,
@@ -65,12 +74,17 @@ const statusText = async (ctx: ExtensionContext): Promise<string> => {
     `Entities: ${insights.entitiesCount ?? "unknown"}`,
     `Strategy: ${config.bankStrategy}`,
     `Recall mode: ${config.recallMode}`,
+    `Recall types: ${config.recallTypes.join(", ")}`,
     `Search budget: ${config.searchBudget}`,
     `Reflect budget: ${config.reflectBudget}`,
     `Reflect dynamic budget: ${config.dialecticDynamic ? "on" : "off"}`,
+    `Reasoning level: ${config.reasoningLevel}`,
+    `Reasoning cap: ${config.reasoningLevelCap ?? "(none)"}`,
     `Write frequency: ${config.writeFrequency}`,
+    `Auto-create bank: ${config.autoCreateBank ? "yes" : "no"}`,
     `Injection: ${config.injectionFrequency}`,
     `Context TTL: ${config.contextRefreshTtlSeconds}s`,
+    `Tool preview length: ${config.toolPreviewLength}`,
     `Max message length: ${config.maxMessageLength}`,
     `Save messages: ${config.saveMessages ? "yes" : "no"}`,
     `Recall indicator: ${config.showRecallIndicator ? (config.indicatorsInContext ? "in-context" : "ui-only") : "off"}`,
@@ -90,27 +104,43 @@ export const registerCommands = (pi: ExtensionAPI): void => {
   pi.registerCommand("hindsight:setup", {
     description: "Interactive first-time setup for Hindsight in pi",
     handler: async (_args: string, ctx: ExtensionContext) => {
-      const existing = await resolveConfig();
+      const existing = await resolveConfig(ctx.cwd);
+      const enabledInput = await ctx.ui.input("Enable Hindsight (true/false)", existing.enabled ? "true" : "false");
       const baseUrl = await ctx.ui.input("Hindsight base URL", existing.baseUrl || "http://localhost:8888");
       const apiKeyInput = await ctx.ui.input("Hindsight API key (optional for local)", mask(existing.apiKey));
       const workspace = await ctx.ui.input("Workspace label", existing.workspace);
       const linkedHostsInput = await ctx.ui.input("Linked host bank aliases (comma-separated, optional)", existing.linkedHosts.join(", "));
       const bankStrategyInput = await ctx.ui.input("Bank strategy", existing.bankStrategy);
-      const recallModeInput = await ctx.ui.input("Recall mode (hybrid/context/tools/off)", existing.recallMode);
-      const reasoningLevelInput = await ctx.ui.input("Reflect reasoning level (low/medium/high)", existing.reasoningLevel);
-      const dynamicInput = await ctx.ui.input("Reflect dynamic budget bump (true/false)", existing.dialecticDynamic ? "true" : "false");
       const manualBankId = await ctx.ui.input("Manual bank ID (optional)", existing.bankId ?? "");
+      const globalBankIdInput = await ctx.ui.input("Global bank ID (optional, for #global / global strategy)", existing.globalBankId ?? "");
+      const recallModeInput = await ctx.ui.input("Recall mode (hybrid/context/tools/off)", existing.recallMode);
+      const recallTypesInput = await ctx.ui.input("Recall types (observation,experience,world)", existing.recallTypes.join(","));
+      const autoCreateBankInput = await ctx.ui.input("Auto-create banks (true/false)", existing.autoCreateBank ? "true" : "false");
+      const writeFrequencyInput = await ctx.ui.input("Write frequency (async/turn/session/or positive integer)", String(existing.writeFrequency));
+      const saveMessagesInput = await ctx.ui.input("Save messages (true/false)", existing.saveMessages ? "true" : "false");
+      const reasoningLevelInput = await ctx.ui.input("Reflect reasoning level (low/medium/high)", existing.reasoningLevel);
+      const reasoningCapInput = await ctx.ui.input("Reflect reasoning cap (blank/low/medium/high)", existing.reasoningLevelCap ?? "");
+      const dynamicInput = await ctx.ui.input("Reflect dynamic budget bump (true/false)", existing.dialecticDynamic ? "true" : "false");
+      const toolPreviewLengthInput = await ctx.ui.input("Tool preview length", String(existing.toolPreviewLength));
 
       await saveConfig({
+        enabled: parseBool(enabledInput, existing.enabled),
         apiKey: apiKeyInput && apiKeyInput !== mask(existing.apiKey) ? apiKeyInput : existing.apiKey,
         baseUrl: baseUrl ?? existing.baseUrl,
         bankId: manualBankId || undefined,
+        globalBankId: globalBankIdInput || undefined,
         bankStrategy: normalizeBankStrategy(bankStrategyInput) as BankStrategy,
         recallMode: normalizeRecallMode(recallModeInput) as RecallMode,
+        recallTypes: normalizeRecallTypes(parseCsv(recallTypesInput)) as RecallType[],
+        autoCreateBank: parseBool(autoCreateBankInput, existing.autoCreateBank),
         workspace: workspace ?? existing.workspace,
         linkedHosts: parseCsv(linkedHostsInput),
+        saveMessages: parseBool(saveMessagesInput, existing.saveMessages),
+        writeFrequency: parseWriteFrequency(writeFrequencyInput, existing.writeFrequency),
         reasoningLevel: normalizeReasoningLevel(reasoningLevelInput) as ReasoningLevel,
-        dialecticDynamic: dynamicInput === "true",
+        reasoningLevelCap: reasoningCapInput?.trim() ? normalizeReasoningLevel(reasoningCapInput) as ReasoningLevel : null,
+        dialecticDynamic: parseBool(dynamicInput, existing.dialecticDynamic),
+        toolPreviewLength: parsePositiveInt(toolPreviewLengthInput, existing.toolPreviewLength),
       });
 
       await connect(ctx);
@@ -121,7 +151,7 @@ export const registerCommands = (pi: ExtensionAPI): void => {
   pi.registerCommand("hindsight:config", {
     description: "Show effective Hindsight config with secrets redacted",
     handler: async (_args: string, ctx: ExtensionContext) => {
-      const config = await resolveConfig();
+      const config = await resolveConfig(ctx.cwd);
       ctx.ui.notify(JSON.stringify({ ...config, apiKey: mask(config.apiKey) }, null, 2), "info");
     },
   });
@@ -129,13 +159,15 @@ export const registerCommands = (pi: ExtensionAPI): void => {
   pi.registerCommand("hindsight:doctor", {
     description: "Run a Hindsight connectivity and bank preflight",
     handler: async (_args: string, ctx: ExtensionContext) => {
-      const config = await resolveConfig();
+      const config = await resolveConfig(ctx.cwd);
       const checks: string[] = [];
       checks.push(`enabled: ${config.enabled ? "yes" : "no"}`);
       checks.push(`base_url: ${config.baseUrl}`);
       checks.push(`workspace: ${config.workspace}`);
+      checks.push(`global_bank: ${config.globalBankId ?? "none"}`);
       checks.push(`linked_hosts: ${config.linkedHosts.length > 0 ? config.linkedHosts.join(", ") : "none"}`);
       checks.push(`bank_strategy: ${config.bankStrategy}`);
+      checks.push(`recall_types: ${config.recallTypes.join(",")}`);
       checks.push(`reasoning_level: ${config.reasoningLevel}`);
       checks.push(`reflect_dynamic_budget: ${config.dialecticDynamic ? "on" : "off"}`);
 
@@ -147,7 +179,7 @@ export const registerCommands = (pi: ExtensionAPI): void => {
       try {
         const handles = await bootstrap(config, ctx.cwd);
         await ensureBank(handles.client, handles.bankId, handles.config);
-        await handles.client.recall(handles.bankId, "health check", { budget: "low", maxTokens: 256 });
+        await handles.client.recall(handles.bankId, "health check", { budget: "low", maxTokens: 256, types: config.recallTypes });
         const insights = await getBankInsights(config.baseUrl, config.apiKey, handles.bankId).catch(() => null);
         checks.push(`active_bank: ${handles.bankId}`);
         checks.push(`connectivity: ok`);
@@ -199,7 +231,7 @@ export const registerCommands = (pi: ExtensionAPI): void => {
         ctx.ui.notify("Usage: /hindsight:map <bank-id>", "warning");
         return;
       }
-      const current = await resolveConfig();
+      const current = await resolveConfig(ctx.cwd);
       await saveConfig({
         mappings: { ...current.mappings, [ctx.cwd]: bankId },
       });
@@ -210,8 +242,9 @@ export const registerCommands = (pi: ExtensionAPI): void => {
   pi.registerCommand("hindsight:recall", {
     description: "Adjust recall/injection settings",
     handler: async (_args: string, ctx: ExtensionContext) => {
-      const existing = await resolveConfig();
+      const existing = await resolveConfig(ctx.cwd);
       const recallModeInput = await ctx.ui.input("Recall mode (hybrid/context/tools/off)", existing.recallMode);
+      const recallTypesInput = await ctx.ui.input("Recall types (observation,experience,world)", existing.recallTypes.join(","));
       const searchBudgetInput = await ctx.ui.input("Search budget (low/mid/high)", existing.searchBudget);
       const reflectBudgetInput = await ctx.ui.input("Reflect budget (low/mid/high)", existing.reflectBudget);
       const contextTokensInput = await ctx.ui.input("Context tokens", String(existing.contextTokens));
@@ -222,10 +255,12 @@ export const registerCommands = (pi: ExtensionAPI): void => {
       const recallIndicatorInput = await ctx.ui.input("Show recall indicator (true/false)", existing.showRecallIndicator ? "true" : "false");
       const indicatorsInContextInput = await ctx.ui.input("Keep indicators in conversation context (true/false)", existing.indicatorsInContext ? "true" : "false");
       const reasoningInput = await ctx.ui.input("Reflect reasoning level (low/medium/high)", existing.reasoningLevel);
+      const reasoningCapInput = await ctx.ui.input("Reflect reasoning cap (blank/low/medium/high)", existing.reasoningLevelCap ?? "");
       const dynamicInput = await ctx.ui.input("Reflect dynamic budget bump (true/false)", existing.dialecticDynamic ? "true" : "false");
 
       await saveConfig({
         recallMode: normalizeRecallMode(recallModeInput),
+        recallTypes: normalizeRecallTypes(parseCsv(recallTypesInput)),
         searchBudget: searchBudgetInput === "low" || searchBudgetInput === "high" ? searchBudgetInput : "mid",
         reflectBudget: reflectBudgetInput === "mid" || reflectBudgetInput === "high" ? reflectBudgetInput : "low",
         contextTokens: parsePositiveInt(contextTokensInput, existing.contextTokens),
@@ -236,62 +271,64 @@ export const registerCommands = (pi: ExtensionAPI): void => {
         showRecallIndicator: parseBool(recallIndicatorInput, existing.showRecallIndicator),
         indicatorsInContext: parseBool(indicatorsInContextInput, existing.indicatorsInContext),
         reasoningLevel: normalizeReasoningLevel(reasoningInput),
+        reasoningLevelCap: reasoningCapInput?.trim() ? normalizeReasoningLevel(reasoningCapInput) : null,
         dialecticDynamic: parseBool(dynamicInput, existing.dialecticDynamic),
       });
-      const updated = await resolveConfig();
+      const updated = await resolveConfig(ctx.cwd);
       setRecallMode(updated.recallMode);
       await connect(ctx);
-      ctx.ui.notify(`Recall settings saved: mode=${updated.recallMode}, search=${updated.searchBudget}, reflect=${updated.reflectBudget}, ttl=${updated.contextRefreshTtlSeconds}s`, "success");
+      ctx.ui.notify(`Recall settings saved: mode=${updated.recallMode}, types=${updated.recallTypes.join(",")}, search=${updated.searchBudget}, reflect=${updated.reflectBudget}, ttl=${updated.contextRefreshTtlSeconds}s`, "success");
     },
   });
 
   pi.registerCommand("hindsight:retain", {
     description: "Adjust retain/upload settings",
     handler: async (_args: string, ctx: ExtensionContext) => {
-      const existing = await resolveConfig();
+      const existing = await resolveConfig(ctx.cwd);
       const writeFrequencyInput = await ctx.ui.input("Write frequency (async/turn/session/or positive integer)", String(existing.writeFrequency));
       const saveMessagesInput = await ctx.ui.input("Save messages (true/false)", existing.saveMessages ? "true" : "false");
       const retainIndicatorInput = await ctx.ui.input("Show retain indicator (true/false)", existing.showRetainIndicator ? "true" : "false");
       const indicatorsInContextInput = await ctx.ui.input("Keep indicators in conversation context (true/false)", existing.indicatorsInContext ? "true" : "false");
       const maxMessageLengthInput = await ctx.ui.input("Max message length", String(existing.maxMessageLength));
-
-      const numericWrite = Number(writeFrequencyInput);
-      const writeFrequency = Number.isInteger(numericWrite) && numericWrite > 0
-        ? numericWrite
-        : writeFrequencyInput === "async" || writeFrequencyInput === "turn" || writeFrequencyInput === "session"
-          ? writeFrequencyInput
-          : existing.writeFrequency;
+      const toolPreviewLengthInput = await ctx.ui.input("Tool preview length", String(existing.toolPreviewLength));
 
       await saveConfig({
-        writeFrequency,
+        writeFrequency: parseWriteFrequency(writeFrequencyInput, existing.writeFrequency),
         saveMessages: parseBool(saveMessagesInput, existing.saveMessages),
         showRetainIndicator: parseBool(retainIndicatorInput, existing.showRetainIndicator),
         indicatorsInContext: parseBool(indicatorsInContextInput, existing.indicatorsInContext),
+        toolPreviewLength: parsePositiveInt(toolPreviewLengthInput, existing.toolPreviewLength),
         maxMessageLength: parsePositiveInt(maxMessageLengthInput, existing.maxMessageLength),
       });
-      const updated = await resolveConfig();
+      const updated = await resolveConfig(ctx.cwd);
       await connect(ctx);
-      ctx.ui.notify(`Retain settings saved: write=${updated.writeFrequency}, saveMessages=${updated.saveMessages ? "yes" : "no"}, maxLen=${updated.maxMessageLength}`, "success");
+      ctx.ui.notify(`Retain settings saved: write=${updated.writeFrequency}, saveMessages=${updated.saveMessages ? "yes" : "no"}, preview=${updated.toolPreviewLength}, maxLen=${updated.maxMessageLength}`, "success");
     },
   });
 
   pi.registerCommand("hindsight:settings", {
     description: "Show quick summary of recall/retain knobs",
     handler: async (_args: string, ctx: ExtensionContext) => {
-      const config = await resolveConfig();
+      const config = await resolveConfig(ctx.cwd);
       ctx.ui.notify([
+        `Enabled: ${config.enabled ? "yes" : "no"}`,
+        `Global bank: ${config.globalBankId ?? "(none)"}`,
         `Recall mode: ${config.recallMode}`,
+        `Recall types: ${config.recallTypes.join(", ")}`,
         `Search budget: ${config.searchBudget}`,
         `Reflect budget: ${config.reflectBudget}`,
         `Reflect dynamic budget: ${config.dialecticDynamic ? "on" : "off"}`,
         `Reasoning level: ${config.reasoningLevel}`,
+        `Reasoning cap: ${config.reasoningLevelCap ?? "(none)"}`,
         `Context tokens: ${config.contextTokens}`,
         `Context TTL: ${config.contextRefreshTtlSeconds}s`,
         `Context cadence: ${config.contextCadence}`,
         `Refresh threshold: ${config.contextRefreshMessageThreshold}`,
         `Injection: ${config.injectionFrequency}`,
         `Write frequency: ${config.writeFrequency}`,
+        `Auto-create bank: ${config.autoCreateBank ? "yes" : "no"}`,
         `Save messages: ${config.saveMessages ? "yes" : "no"}`,
+        `Tool preview length: ${config.toolPreviewLength}`,
         `Recall indicator: ${config.showRecallIndicator ? (config.indicatorsInContext ? "in-context" : "ui-only") : "off"}`,
         `Retain indicator: ${config.showRetainIndicator ? (config.indicatorsInContext ? "in-context" : "ui-only") : "off"}`,
         `Max message length: ${config.maxMessageLength}`,

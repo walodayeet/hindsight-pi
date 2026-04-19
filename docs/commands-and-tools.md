@@ -24,15 +24,20 @@ When model should use it:
 - low-cost context lookup is enough
 - raw evidence is preferable to synthesis
 
-Proposed parameters:
+Implemented parameters:
 
 ```ts
 {
   query: string;
   budget?: 'low' | 'mid' | 'high';
-  types?: Array<'world' | 'experience' | 'observation'>;
 }
 ```
+
+Behavior:
+- uses configured `recallTypes` from `config.json`
+- searches active bank
+- also searches `globalBankId` when configured
+- also fans out to linked hosts when configured
 
 Output:
 - numbered raw memory snippets
@@ -122,12 +127,17 @@ Purpose:
 - first-time setup flow
 
 Responsibilities:
+- collect enabled flag
 - collect base URL
 - collect API key if needed
 - choose bank strategy
 - optionally set manual bank ID
+- optionally set global bank ID
+- collect recall types
+- collect write frequency and save-messages behavior
+- collect reasoning level/cap and preview length
 - save config
-- optionally test connectivity
+- reconnect and validate
 
 ## 2. `/hindsight:status`
 
@@ -138,9 +148,12 @@ Should display:
 - enabled/disabled
 - connected/offline
 - active bank ID
+- global bank ID
 - base URL
 - recall mode
-- pending upload count if any
+- recall types
+- reasoning level/cap
+- write frequency
 - cache freshness info if available
 
 ## 3. `/hindsight:config`
@@ -163,7 +176,7 @@ Checks should include:
 - auth valid
 - bank resolved
 - bank exists or can be created
-- simple recall works
+- simple recall works with configured `recallTypes`
 
 ## 5. `/hindsight:mode`
 
@@ -176,7 +189,7 @@ Use:
 ## 6. `/hindsight:sync`
 
 Purpose:
-- force immediate flush + context refresh
+- force immediate context refresh
 
 Use:
 - after major decisions
@@ -216,6 +229,6 @@ Why no direct `profile` analog in MVP:
 
 ## Recommended MVP Surface
 
-Implement in TP-003:
+Implemented:
 - tools: `hindsight_search`, `hindsight_context`, `hindsight_retain`, `hindsight_bank_profile`
-- commands: `/hindsight:setup`, `/hindsight:status`, `/hindsight:config`, `/hindsight:doctor`, `/hindsight:mode`, `/hindsight:sync`, `/hindsight:map`
+- commands: `/hindsight:setup`, `/hindsight:status`, `/hindsight:config`, `/hindsight:doctor`, `/hindsight:mode`, `/hindsight:sync`, `/hindsight:map`, `/hindsight:recall`, `/hindsight:retain`, `/hindsight:settings`

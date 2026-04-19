@@ -8,6 +8,7 @@ export type WriteFrequency = "async" | "turn" | "session";
 export type InjectionFrequency = "every-turn" | "first-turn";
 export type SearchBudget = "low" | "mid" | "high";
 export type ReasoningLevel = "low" | "medium" | "high";
+export type RecallType = "world" | "experience" | "observation";
 
 export interface HostConfig {
   enabled?: boolean;
@@ -16,6 +17,7 @@ export interface HostConfig {
   aiPeer?: string;
   linkedHosts?: string[];
   recallMode?: RecallMode;
+  recallTypes?: RecallType[];
   autoCreateBank?: boolean;
   contextTokens?: number;
   contextRefreshTtlSeconds?: number;
@@ -49,10 +51,16 @@ export interface LinkedHostFileConfig {
 
 export interface HindsightConfigFile {
   apiKey?: string;
+  api_key?: string;
   baseUrl?: string;
+  api_url?: string;
   bankId?: string;
+  bank_id?: string;
   globalBankId?: string;
+  global_bank?: string;
   bankStrategy?: BankStrategy;
+  recallTypes?: RecallType[];
+  recall_types?: RecallType[] | string;
   mappings?: Record<string, string>;
   host?: {
     pi?: HostConfig;
@@ -85,6 +93,7 @@ export interface HindsightConfig {
   linkedHosts: string[];
   linkedHostConfigs: ResolvedLinkedHostConfig[];
   recallMode: RecallMode;
+  recallTypes: RecallType[];
   autoCreateBank: boolean;
   contextTokens: number;
   contextRefreshTtlSeconds: number;
@@ -108,6 +117,7 @@ export interface HindsightConfig {
 }
 
 export const CONFIG_PATH = join(homedir(), ".hindsight", "config.json");
+export const LOCAL_CONFIG_PATH = ".hindsight/config.json";
 const DEFAULT_BASE_URL = "http://localhost:8888";
 
 const intOr = (value: unknown, fallback: number): number => {
@@ -129,6 +139,20 @@ const csvOr = (value: unknown, fallback: string[] = []): string[] => {
   if (Array.isArray(value)) return value.filter((v): v is string => typeof v === "string" && v.trim().length > 0);
   if (typeof value === "string") return value.split(",").map((v) => v.trim()).filter(Boolean);
   return fallback;
+};
+
+export const normalizeRecallTypes = (value: unknown): RecallType[] => {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(",").map((entry) => entry.trim())
+      : [];
+
+  const normalized = values.filter((entry): entry is RecallType => (
+    entry === "world" || entry === "experience" || entry === "observation"
+  ));
+
+  return normalized.length > 0 ? [...new Set(normalized)] : ["observation"];
 };
 
 export const normalizeBankStrategy = (value: unknown): BankStrategy => {
@@ -195,17 +219,43 @@ let activeRecallMode: RecallMode = "hybrid";
 export const getRecallMode = (): RecallMode => activeRecallMode;
 export const setRecallMode = (mode: RecallMode): void => { activeRecallMode = mode; };
 
-export const readConfigFile = async (): Promise<HindsightConfigFile | null> => {
+const readJsonIfPresent = async (path: string): Promise<HindsightConfigFile | null> => {
   try {
-    const raw = await readFile(CONFIG_PATH, "utf8");
+    const raw = await readFile(path, "utf8");
     return JSON.parse(raw) as HindsightConfigFile;
   } catch {
     return null;
   }
 };
 
-export const resolveConfig = async (): Promise<HindsightConfig> => {
-  const file = await readConfigFile();
+export const readConfigFile = async (cwd?: string): Promise<HindsightConfigFile | null> => {
+  const globalConfig = await readJsonIfPresent(CONFIG_PATH);
+  const localConfig = cwd ? await readJsonIfPresent(join(cwd, LOCAL_CONFIG_PATH)) : null;
+  if (!globalConfig && !localConfig) return null;
+  return {
+    ...(globalConfig ?? {}),
+    ...(localConfig ?? {}),
+    host: {
+      ...((globalConfig?.host) ?? {}),
+      ...((localConfig?.host) ?? {}),
+      pi: {
+        ...((globalConfig?.host?.pi) ?? {}),
+        ...((localConfig?.host?.pi) ?? {}),
+      },
+    },
+    hosts: {
+      ...((globalConfig?.hosts) ?? {}),
+      ...((localConfig?.hosts) ?? {}),
+    },
+    mappings: {
+      ...((globalConfig?.mappings) ?? {}),
+      ...((localConfig?.mappings) ?? {}),
+    },
+  };
+};
+
+export const resolveConfig = async (cwd?: string): Promise<HindsightConfig> => {
+  const file = await readConfigFile(cwd);
   const host = file?.host?.pi ?? {};
   const linkedHosts = csvOr(host.linkedHosts);
   const linkedHostConfigs: ResolvedLinkedHostConfig[] = linkedHosts.flatMap((name) => {
@@ -213,10 +263,10 @@ export const resolveConfig = async (): Promise<HindsightConfig> => {
     if (!entry) return [];
     const resolved: ResolvedLinkedHostConfig = {
       name,
-      baseUrl: entry.baseUrl ?? file?.baseUrl ?? DEFAULT_BASE_URL,
-      apiKey: entry.apiKey ?? file?.apiKey,
+      baseUrl: entry.baseUrl ?? file?.baseUrl ?? file?.api_url ?? DEFAULT_BASE_URL,
+      apiKey: entry.apiKey ?? file?.apiKey ?? file?.api_key,
       bankId: entry.bankId,
-      globalBankId: file?.globalBankId,
+      globalBankId: file?.globalBankId ?? file?.global_bank,
       bankStrategy: normalizeBankStrategy(entry.bankStrategy ?? file?.bankStrategy),
       workspace: entry.workspace ?? name,
       peerName: entry.peerName ?? (host.peerName ?? "user"),
@@ -226,11 +276,11 @@ export const resolveConfig = async (): Promise<HindsightConfig> => {
   });
 
   const config: HindsightConfig = {
-    enabled: boolOr(process.env.HINDSIGHT_ENABLED ?? host.enabled, Boolean(process.env.HINDSIGHT_API_KEY || file?.apiKey || process.env.HINDSIGHT_BASE_URL || file?.baseUrl)),
-    apiKey: process.env.HINDSIGHT_API_KEY ?? file?.apiKey,
-    baseUrl: process.env.HINDSIGHT_BASE_URL ?? file?.baseUrl ?? DEFAULT_BASE_URL,
-    bankId: process.env.HINDSIGHT_BANK_ID ?? file?.bankId,
-    globalBankId: file?.globalBankId,
+    enabled: boolOr(process.env.HINDSIGHT_ENABLED ?? host.enabled, Boolean(process.env.HINDSIGHT_API_KEY || file?.apiKey || file?.api_key || process.env.HINDSIGHT_BASE_URL || file?.baseUrl || file?.api_url)),
+    apiKey: process.env.HINDSIGHT_API_KEY ?? file?.apiKey ?? file?.api_key,
+    baseUrl: process.env.HINDSIGHT_BASE_URL ?? file?.baseUrl ?? file?.api_url ?? DEFAULT_BASE_URL,
+    bankId: process.env.HINDSIGHT_BANK_ID ?? file?.bankId ?? file?.bank_id,
+    globalBankId: process.env.HINDSIGHT_GLOBAL_BANK_ID ?? file?.globalBankId ?? file?.global_bank,
     bankStrategy: normalizeBankStrategy(process.env.HINDSIGHT_BANK_STRATEGY ?? file?.bankStrategy),
     workspace: host.workspace ?? "pi",
     peerName: host.peerName ?? "user",
@@ -238,6 +288,7 @@ export const resolveConfig = async (): Promise<HindsightConfig> => {
     linkedHosts,
     linkedHostConfigs,
     recallMode: normalizeRecallMode(process.env.HINDSIGHT_RECALL_MODE ?? host.recallMode),
+    recallTypes: normalizeRecallTypes(process.env.HINDSIGHT_RECALL_TYPES ?? host.recallTypes ?? file?.recallTypes ?? file?.recall_types),
     autoCreateBank: boolOr(process.env.HINDSIGHT_AUTO_CREATE_BANK ?? host.autoCreateBank, true),
     contextTokens: intOr(process.env.HINDSIGHT_CONTEXT_TOKENS ?? host.contextTokens, 1200),
     contextRefreshTtlSeconds: intOr(process.env.HINDSIGHT_CONTEXT_REFRESH_TTL_SECONDS ?? host.contextRefreshTtlSeconds, 300),
@@ -265,11 +316,15 @@ export const resolveConfig = async (): Promise<HindsightConfig> => {
 };
 
 export const saveConfig = async (input: {
+  enabled?: boolean;
   apiKey?: string;
   baseUrl?: string;
   bankId?: string;
+  globalBankId?: string;
   bankStrategy?: BankStrategy;
   recallMode?: RecallMode;
+  recallTypes?: RecallType[];
+  autoCreateBank?: boolean;
   logging?: boolean;
   peerName?: string;
   aiPeer?: string;
@@ -277,6 +332,7 @@ export const saveConfig = async (input: {
   linkedHosts?: string[];
   dialecticDynamic?: boolean;
   reasoningLevel?: ReasoningLevel;
+  reasoningLevelCap?: ReasoningLevel | null;
   searchBudget?: SearchBudget;
   reflectBudget?: SearchBudget;
   contextTokens?: number;
@@ -286,6 +342,7 @@ export const saveConfig = async (input: {
   injectionFrequency?: InjectionFrequency;
   writeFrequency?: WriteFrequency | number;
   saveMessages?: boolean;
+  toolPreviewLength?: number;
   maxMessageLength?: number;
   showRecallIndicator?: boolean;
   showRetainIndicator?: boolean;
@@ -295,23 +352,34 @@ export const saveConfig = async (input: {
   const current = (await readConfigFile()) ?? {};
   const next: HindsightConfigFile = {
     ...current,
-    apiKey: input.apiKey ?? current.apiKey,
-    baseUrl: input.baseUrl ?? current.baseUrl,
-    bankId: input.bankId ?? current.bankId,
+    apiKey: input.apiKey ?? current.apiKey ?? current.api_key,
+    api_key: input.apiKey ?? current.apiKey ?? current.api_key,
+    baseUrl: input.baseUrl ?? current.baseUrl ?? current.api_url,
+    api_url: input.baseUrl ?? current.baseUrl ?? current.api_url,
+    bankId: input.bankId ?? current.bankId ?? current.bank_id,
+    bank_id: input.bankId ?? current.bankId ?? current.bank_id,
+    globalBankId: input.globalBankId ?? current.globalBankId ?? current.global_bank,
+    global_bank: input.globalBankId ?? current.globalBankId ?? current.global_bank,
     bankStrategy: input.bankStrategy ?? current.bankStrategy,
+    recallTypes: input.recallTypes ?? current.recallTypes ?? normalizeRecallTypes(current.recall_types),
+    recall_types: input.recallTypes ?? current.recallTypes ?? normalizeRecallTypes(current.recall_types),
     mappings: input.mappings ?? current.mappings,
     host: {
       ...(current.host ?? {}),
       pi: {
         ...(current.host?.pi ?? {}),
+        enabled: input.enabled ?? current.host?.pi?.enabled,
         workspace: input.workspace ?? current.host?.pi?.workspace,
         peerName: input.peerName ?? current.host?.pi?.peerName,
         aiPeer: input.aiPeer ?? current.host?.pi?.aiPeer,
         linkedHosts: input.linkedHosts ?? current.host?.pi?.linkedHosts,
         recallMode: input.recallMode ?? current.host?.pi?.recallMode,
+        recallTypes: input.recallTypes ?? current.host?.pi?.recallTypes,
+        autoCreateBank: input.autoCreateBank ?? current.host?.pi?.autoCreateBank,
         logging: input.logging ?? current.host?.pi?.logging,
         dialecticDynamic: input.dialecticDynamic ?? current.host?.pi?.dialecticDynamic,
         reasoningLevel: input.reasoningLevel ?? current.host?.pi?.reasoningLevel,
+        reasoningLevelCap: input.reasoningLevelCap === null ? undefined : input.reasoningLevelCap ?? current.host?.pi?.reasoningLevelCap,
         showRecallIndicator: input.showRecallIndicator ?? current.host?.pi?.showRecallIndicator,
         showRetainIndicator: input.showRetainIndicator ?? current.host?.pi?.showRetainIndicator,
         indicatorsInContext: input.indicatorsInContext ?? current.host?.pi?.indicatorsInContext,
@@ -324,6 +392,7 @@ export const saveConfig = async (input: {
         injectionFrequency: input.injectionFrequency ?? current.host?.pi?.injectionFrequency,
         writeFrequency: input.writeFrequency ?? current.host?.pi?.writeFrequency,
         saveMessages: input.saveMessages ?? current.host?.pi?.saveMessages,
+        toolPreviewLength: input.toolPreviewLength ?? current.host?.pi?.toolPreviewLength,
         maxMessageLength: input.maxMessageLength ?? current.host?.pi?.maxMessageLength,
       },
     },

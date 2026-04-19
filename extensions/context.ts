@@ -11,6 +11,11 @@ let cachedContext: CachedContext = EMPTY;
 let messagesSinceRefresh = 0;
 export let pendingRefresh: Promise<void> | null = null;
 
+const uniqueBankIds = (handles: HindsightHandles): string[] => {
+  const ids = [handles.bankId, handles.config.globalBankId].filter((value): value is string => Boolean(value));
+  return [...new Set(ids)];
+};
+
 export const clearCachedContext = (): void => {
   cachedContext = EMPTY;
   messagesSinceRefresh = 0;
@@ -42,17 +47,23 @@ const renderResults = (results: Array<{ text?: string; type?: string }>, context
 };
 
 export const refreshCachedContext = async (handles: HindsightHandles): Promise<void> => {
-  const result = await handles.client.recall(
-    handles.bankId,
-    "What user preferences, durable project facts, architecture facts, and recent coding context matter for this pi workspace?",
-    {
+  const query = "What user preferences, durable project facts, architecture facts, and recent coding context matter for this pi workspace?";
+  const settled = await Promise.allSettled(uniqueBankIds(handles).map(async (bankId) => {
+    const result = await handles.client.recall(bankId, query, {
       budget: handles.config.searchBudget,
       maxTokens: Math.max(handles.config.contextTokens * 2, 512),
-    },
-  );
+      types: handles.config.recallTypes,
+    });
+    return result?.results ?? [];
+  }));
+
+  const results = settled
+    .filter((entry): entry is PromiseFulfilledResult<Array<{ text?: string; type?: string }>> => entry.status === "fulfilled")
+    .map((entry) => entry.value)
+    .flat();
 
   cachedContext = {
-    text: renderResults(result?.results ?? [], handles.config.contextTokens),
+    text: renderResults(results, handles.config.contextTokens),
     refreshedAt: Date.now(),
     pinned: false,
   };
