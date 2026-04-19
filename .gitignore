@@ -1,0 +1,12 @@
+# Dependencies / package output
+node_modules/
+*.tgz
+npm-debug.log*
+
+# Pi / taskplane runtime artifacts
+.pi/
+.worktrees/
+taskplane-tasks/
+
+# Pi project-local packages (if using pi install -l)
+.pi/npm/
