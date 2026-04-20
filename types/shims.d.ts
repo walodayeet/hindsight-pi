@@ -24,3 +24,8 @@ declare module '@mariozechner/pi-coding-agent' {
 declare module '@sinclair/typebox' {
   export const Type: any;
 }
+
+declare module '@mariozechner/pi-tui' {
+  export const Box: any;
+  export const Text: any;
+}

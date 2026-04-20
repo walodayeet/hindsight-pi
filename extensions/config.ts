@@ -183,7 +183,7 @@ export const normalizeRecallMode = (value: unknown): RecallMode => {
   }
 };
 
-const normalizeInjectionFrequency = (value: unknown): InjectionFrequency => value === "first-turn" ? "first-turn" : "every-turn";
+const normalizeInjectionFrequency = (value: unknown): InjectionFrequency => value === "every-turn" ? "every-turn" : "first-turn";
 
 const normalizeBudget = (value: unknown, fallback: SearchBudget): SearchBudget => {
   switch (value) {
@@ -342,7 +342,7 @@ export const resolveConfig = async (cwd?: string): Promise<HindsightConfig> => {
     contextRefreshTtlSeconds: intOr(process.env.HINDSIGHT_CONTEXT_REFRESH_TTL_SECONDS ?? host.contextRefreshTtlSeconds, 300),
     contextRefreshMessageThreshold: intOr(process.env.HINDSIGHT_CONTEXT_REFRESH_MESSAGE_THRESHOLD ?? host.contextRefreshMessageThreshold, 8),
     contextCadence: intOr(process.env.HINDSIGHT_CONTEXT_CADENCE ?? host.contextCadence, 1),
-    injectionFrequency: normalizeInjectionFrequency(process.env.HINDSIGHT_INJECTION_FREQUENCY ?? host.injectionFrequency),
+    injectionFrequency: normalizeInjectionFrequency(process.env.HINDSIGHT_INJECTION_FREQUENCY ?? host.injectionFrequency ?? "first-turn"),
     writeFrequency: normalizeWriteFrequency(process.env.HINDSIGHT_WRITE_FREQUENCY ?? host.writeFrequency),
     saveMessages: boolOr(process.env.HINDSIGHT_SAVE_MESSAGES ?? host.saveMessages, true),
     searchBudget: normalizeBudget(process.env.HINDSIGHT_SEARCH_BUDGET ?? host.searchBudget, "mid"),

@@ -89,6 +89,7 @@ export interface RetainSummary {
   mode: "queued" | "saved";
   itemsCount: number;
   previews: string[];
+  fullText: string;
 }
 
 export type RetainOutcome =
@@ -140,11 +141,13 @@ const buildTurnSummary = (messages: any[]): string => {
   return sections.join("\n\n").trim();
 };
 
-const toRetainItems = (handles: HindsightHandles, messages: any[], bankId = handles.bankId): RetainItem[] => {
+const toRetainItems = (handles: HindsightHandles, messages: any[], bankId = handles.bankId): { summary: string; items: RetainItem[] } => {
   const summary = buildTurnSummary(messages);
-  if (!summary) return [];
+  if (!summary) return { summary: "", items: [] };
   const chunks = chunkTextSmart(summary, handles.config.maxMessageLength);
-  return chunks.map((chunk) => ({
+  return {
+    summary,
+    items: chunks.map((chunk) => ({
     content: chunk,
     metadata: {
       source: "pi",
@@ -152,8 +155,9 @@ const toRetainItems = (handles: HindsightHandles, messages: any[], bankId = hand
       bankId,
       workspace: handles.config.workspace,
     },
-    timestamp: new Date(),
-  }));
+      timestamp: new Date(),
+    })),
+  };
 };
 
 const previewItems = (items: RetainItem[], limit = 3): string[] =>
@@ -219,8 +223,9 @@ export class WriteScheduler {
       bankIds.push(handles.config.globalBankId);
     }
 
+    const base = toRetainItems(handles, messages, handles.bankId);
     const writes = bankIds
-      .map((bankId) => ({ bankId, items: toRetainItems(handles, messages, bankId) }))
+      .map((bankId) => ({ bankId, items: toRetainItems(handles, messages, bankId).items }))
       .filter((entry) => entry.items.length > 0);
     if (writes.length === 0) return null;
 
@@ -228,6 +233,7 @@ export class WriteScheduler {
       mode: "saved",
       itemsCount: writes.reduce((count, entry) => count + entry.items.length, 0),
       previews: previewItems(writes[0]?.items ?? []),
+      fullText: base.summary,
     };
 
     this.turnCount += 1;

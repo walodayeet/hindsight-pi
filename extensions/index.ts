@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Box, Text } from "@mariozechner/pi-tui";
 import { bootstrap, clearHandles, getHandles } from "./client.js";
 import { registerCommands } from "./commands.js";
 import { getRecallMode, resolveConfig } from "./config.js";
@@ -36,6 +37,27 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     pi.sendMessage({ customType: type, content, display: true, details });
   };
 
+  pi.registerMessageRenderer(RECALL_MESSAGE_TYPE, (message: any, options: any, theme: any) => {
+    const details = (message.details ?? {}) as { bankId?: string; previews?: string[]; chars?: number };
+    const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
+    let text = `${theme.fg("accent", "🧠 Hindsight recall")} ${theme.fg("muted", details.bankId ?? "")}`.trim();
+    if (details.previews?.length) text += `\n${details.previews.map((line) => `• ${line}`).join("\n")}`;
+    if (options.expanded && details.chars) text += `\n${theme.fg("dim", `${details.chars} chars injected`)}`;
+    box.addChild(new Text(text, 0, 0));
+    return box;
+  });
+
+  pi.registerMessageRenderer(RETAIN_MESSAGE_TYPE, (message: any, options: any, theme: any) => {
+    const details = (message.details ?? {}) as { mode?: string; bankId?: string; fullText?: string; itemsCount?: number };
+    const color = details.mode === "saved" ? "success" : "warning";
+    const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
+    let text = `${theme.fg(color, details.mode === "saved" ? "💾 Hindsight retained" : "⏳ Hindsight queued")} ${theme.fg("muted", details.bankId ?? "")}`.trim();
+    if (details.itemsCount) text += `\n${theme.fg("dim", `${details.itemsCount} item(s)`)}`;
+    if (details.fullText) text += `\n${options.expanded ? details.fullText : `${details.fullText.slice(0, 220)}${details.fullText.length > 220 ? "…" : ""}`}`;
+    box.addChild(new Text(text, 0, 0));
+    return box;
+  });
+
   registerTools(pi);
   registerCommands(pi);
 
@@ -59,15 +81,15 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
         }
 
         scheduler = new WriteScheduler(config.writeFrequency, ({ handles, summary }) => {
-          emitIndicator(handles.config, RETAIN_MESSAGE_TYPE, `retain successful: ${summary.itemsCount} item(s) for bank ${handles.bankId}`, {
+          emitIndicator(handles.config, RETAIN_MESSAGE_TYPE, `retain successful for bank ${handles.bankId}:\n${summary.fullText}`, {
             mode: "saved",
             bankId: handles.bankId,
             itemsCount: summary.itemsCount,
             previews: summary.previews,
+            fullText: summary.fullText,
           });
         });
         const handles = await bootstrap(config, ctx.cwd);
-        if (config.renameSessionToBank) pi.setSessionName(handles.bankId);
         await refreshCachedContext(handles);
         setHookStat("sessionStart", { firedAt: new Date().toISOString(), result: "ok", detail: `bank=${handles.bankId}` });
         if (config.injectionFrequency === "first-turn") pinCachedContext();
@@ -140,7 +162,7 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
         const { summary } = outcome;
         setHookStat("retain", { firedAt: new Date().toISOString(), result: "ok", detail: `${summary.mode}:${summary.itemsCount}` });
         const verb = summary.mode === "queued" ? "queued retain" : "retain successful";
-        emitIndicator(handles.config, RETAIN_MESSAGE_TYPE, `${verb}: ${summary.itemsCount} item(s) for bank ${handles.bankId}`, {
+        emitIndicator(handles.config, RETAIN_MESSAGE_TYPE, `${verb} for bank ${handles.bankId}:\n${summary.fullText}`, {
           mode: summary.mode,
           bankId: handles.bankId,
           itemsCount: summary.itemsCount,
