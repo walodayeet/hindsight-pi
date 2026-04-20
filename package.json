@@ -1,6 +1,6 @@
 {
   "name": "@walodayeet/hindsight-pi",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Hindsight-backed persistent memory extension for pi",
   "type": "module",
   "license": "MIT",
