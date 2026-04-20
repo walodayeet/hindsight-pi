@@ -1,10 +1,16 @@
 {
   "name": "@walodayeet/hindsight-pi",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Hindsight-backed persistent memory extension for pi",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package", "pi", "hindsight", "memory", "extension"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "hindsight",
+    "memory",
+    "extension"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/walodayeet/pi-hindsight.git"
