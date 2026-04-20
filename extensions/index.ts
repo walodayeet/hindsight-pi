@@ -5,6 +5,7 @@ import { getRecallMode, resolveConfig } from "./config.js";
 import { backgroundRefresh, clearCachedContext, incrementMessageCount, pendingRefresh, pinCachedContext, previewCachedContext, refreshCachedContext, renderCachedContext, shouldRefreshCachedContext } from "./context.js";
 import { registerTools } from "./tools.js";
 import { WriteScheduler } from "./upload.js";
+import { resetHookStats, setHookStat } from "./hooks.js";
 
 const setStatus = (ctx: { ui: { setStatus(id: string, text: string): void } }, state: "off" | "connected" | "syncing" | "offline") => {
   const labels: Record<typeof state, string> = {
@@ -47,10 +48,13 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
         lastContextTurn = 0;
         scheduler?.reset();
         scheduler = null;
+        resetHookStats();
+        setHookStat("sessionStart", { firedAt: new Date().toISOString(), result: "ok" });
 
         const config = await resolveConfig();
         if (!config.enabled) {
           setStatus(ctx, "off");
+          setHookStat("sessionStart", { firedAt: new Date().toISOString(), result: "skipped", detail: "disabled" });
           return;
         }
 
@@ -63,12 +67,14 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
           });
         });
         const handles = await bootstrap(config, ctx.cwd);
-        pi.setSessionName(handles.bankId);
+        if (config.renameSessionToBank) pi.setSessionName(handles.bankId);
         await refreshCachedContext(handles);
+        setHookStat("sessionStart", { firedAt: new Date().toISOString(), result: "ok", detail: `bank=${handles.bankId}` });
         if (config.injectionFrequency === "first-turn") pinCachedContext();
         setStatus(ctx, "connected");
       } catch (error) {
         console.error("[hindsight-pi] initialization failed:", error instanceof Error ? error.message : error);
+        setHookStat("sessionStart", { firedAt: new Date().toISOString(), result: "failed", detail: error instanceof Error ? error.message : String(error) });
         setStatus(ctx, "offline");
       } finally {
         initializing = null;
@@ -99,8 +105,12 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     }
 
     const memory = renderCachedContext();
-    if (!memory) return;
+    if (!memory) {
+      setHookStat("recall", { firedAt: new Date().toISOString(), result: "skipped", detail: "empty" });
+      return;
+    }
     const previews = previewCachedContext(3);
+    setHookStat("recall", { firedAt: new Date().toISOString(), result: "ok", detail: `${previews.length > 0 ? previews.length : 1} snippet(s)` });
     emitIndicator(handles.config, RECALL_MESSAGE_TYPE, `recall injected: ${previews.length > 0 ? previews.length : 1} memory snippet(s) into bank ${handles.bankId}`, {
       bankId: handles.bankId,
       previews,
@@ -120,9 +130,15 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     incrementMessageCount(event.messages.length);
     setStatus(ctx, "syncing");
     try {
-      const summary = await scheduler?.onTurnEnd(handles, event.messages as any[]);
+      const outcome = await scheduler?.onTurnEnd(handles, event.messages as any[]);
       setStatus(ctx, "connected");
-      if (summary) {
+      if (outcome?.skipped) {
+        setHookStat("retain", { firedAt: new Date().toISOString(), result: "skipped", detail: outcome.reason });
+        return;
+      }
+      if (outcome && !outcome.skipped) {
+        const { summary } = outcome;
+        setHookStat("retain", { firedAt: new Date().toISOString(), result: "ok", detail: `${summary.mode}:${summary.itemsCount}` });
         const verb = summary.mode === "queued" ? "queued retain" : "retain successful";
         emitIndicator(handles.config, RETAIN_MESSAGE_TYPE, `${verb}: ${summary.itemsCount} item(s) for bank ${handles.bankId}`, {
           mode: summary.mode,
@@ -133,6 +149,7 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
       }
     } catch (error) {
       console.error("[hindsight-pi] upload failed:", error instanceof Error ? error.message : error);
+      setHookStat("retain", { firedAt: new Date().toISOString(), result: "failed", detail: error instanceof Error ? error.message : String(error) });
       setStatus(ctx, "offline");
     }
   });

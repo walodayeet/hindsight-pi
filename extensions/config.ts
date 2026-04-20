@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 
 export type BankStrategy = "per-directory" | "git-branch" | "pi-session" | "per-repo" | "global" | "manual";
 export type RecallMode = "hybrid" | "context" | "tools" | "off";
@@ -37,6 +37,7 @@ export interface HostConfig {
   showRecallIndicator?: boolean;
   showRetainIndicator?: boolean;
   indicatorsInContext?: boolean;
+  renameSessionToBank?: boolean;
 }
 
 export interface LinkedHostFileConfig {
@@ -113,6 +114,7 @@ export interface HindsightConfig {
   showRecallIndicator: boolean;
   showRetainIndicator: boolean;
   indicatorsInContext: boolean;
+  renameSessionToBank: boolean;
   mappings: Record<string, string>;
 }
 
@@ -228,30 +230,76 @@ const readJsonIfPresent = async (path: string): Promise<HindsightConfigFile | nu
   }
 };
 
-export const readConfigFile = async (cwd?: string): Promise<HindsightConfigFile | null> => {
-  const globalConfig = await readJsonIfPresent(CONFIG_PATH);
-  const localConfig = cwd ? await readJsonIfPresent(join(cwd, LOCAL_CONFIG_PATH)) : null;
-  if (!globalConfig && !localConfig) return null;
+const parseTomlFile = async (path: string): Promise<HindsightConfigFile | null> => {
+  try {
+    const raw = await readFile(path, "utf8");
+    const out: Record<string, unknown> = {};
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const match = trimmed.match(/^([a-zA-Z0-9_]+)\s*=\s*(.+)$/);
+      if (!match) continue;
+      const [, key, valueRaw] = match;
+      const value = valueRaw.trim().replace(/^"|"$/g, "").replace(/^'|'$/g, "");
+      if (key === "recall_types") out.recall_types = value;
+      else if (key === "api_url") out.api_url = value;
+      else if (key === "api_key") out.api_key = value;
+      else if (key === "bank_id") out.bank_id = value;
+      else if (key === "global_bank") out.global_bank = value;
+    }
+    return Object.keys(out).length > 0 ? out as HindsightConfigFile : null;
+  } catch {
+    return null;
+  }
+};
+
+const mergeConfigFiles = (base: HindsightConfigFile | null, next: HindsightConfigFile | null): HindsightConfigFile | null => {
+  if (!base && !next) return null;
   return {
-    ...(globalConfig ?? {}),
-    ...(localConfig ?? {}),
+    ...(base ?? {}),
+    ...(next ?? {}),
     host: {
-      ...((globalConfig?.host) ?? {}),
-      ...((localConfig?.host) ?? {}),
+      ...((base?.host) ?? {}),
+      ...((next?.host) ?? {}),
       pi: {
-        ...((globalConfig?.host?.pi) ?? {}),
-        ...((localConfig?.host?.pi) ?? {}),
+        ...((base?.host?.pi) ?? {}),
+        ...((next?.host?.pi) ?? {}),
       },
     },
     hosts: {
-      ...((globalConfig?.hosts) ?? {}),
-      ...((localConfig?.hosts) ?? {}),
+      ...((base?.hosts) ?? {}),
+      ...((next?.hosts) ?? {}),
     },
     mappings: {
-      ...((globalConfig?.mappings) ?? {}),
-      ...((localConfig?.mappings) ?? {}),
+      ...((base?.mappings) ?? {}),
+      ...((next?.mappings) ?? {}),
     },
   };
+};
+
+const collectParentDirs = (cwd: string): string[] => {
+  const dirs: string[] = [];
+  let current = resolvePath(cwd);
+  while (true) {
+    dirs.push(current);
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return dirs.reverse();
+};
+
+export const readConfigFile = async (cwd?: string): Promise<HindsightConfigFile | null> => {
+  let merged = mergeConfigFiles(await parseTomlFile(join(homedir(), ".hindsight", "config.toml")), await readJsonIfPresent(CONFIG_PATH));
+
+  if (cwd) {
+    for (const dir of collectParentDirs(cwd)) {
+      merged = mergeConfigFiles(merged, await parseTomlFile(join(dir, ".hindsight", "config.toml")));
+      merged = mergeConfigFiles(merged, await readJsonIfPresent(join(dir, LOCAL_CONFIG_PATH)));
+    }
+  }
+
+  return merged;
 };
 
 export const resolveConfig = async (cwd?: string): Promise<HindsightConfig> => {
@@ -308,6 +356,7 @@ export const resolveConfig = async (cwd?: string): Promise<HindsightConfig> => {
     showRecallIndicator: boolOr(process.env.HINDSIGHT_SHOW_RECALL_INDICATOR ?? host.showRecallIndicator, true),
     showRetainIndicator: boolOr(process.env.HINDSIGHT_SHOW_RETAIN_INDICATOR ?? host.showRetainIndicator, true),
     indicatorsInContext: boolOr(process.env.HINDSIGHT_INDICATORS_IN_CONTEXT ?? host.indicatorsInContext, false),
+    renameSessionToBank: boolOr(process.env.HINDSIGHT_RENAME_SESSION_TO_BANK ?? host.renameSessionToBank, false),
     mappings: file?.mappings ?? {},
   };
 
@@ -347,6 +396,7 @@ export const saveConfig = async (input: {
   showRecallIndicator?: boolean;
   showRetainIndicator?: boolean;
   indicatorsInContext?: boolean;
+  renameSessionToBank?: boolean;
   mappings?: Record<string, string>;
 }): Promise<void> => {
   const current = (await readConfigFile()) ?? {};
@@ -383,6 +433,7 @@ export const saveConfig = async (input: {
         showRecallIndicator: input.showRecallIndicator ?? current.host?.pi?.showRecallIndicator,
         showRetainIndicator: input.showRetainIndicator ?? current.host?.pi?.showRetainIndicator,
         indicatorsInContext: input.indicatorsInContext ?? current.host?.pi?.indicatorsInContext,
+        renameSessionToBank: input.renameSessionToBank ?? current.host?.pi?.renameSessionToBank,
         searchBudget: input.searchBudget ?? current.host?.pi?.searchBudget,
         reflectBudget: input.reflectBudget ?? current.host?.pi?.reflectBudget,
         contextTokens: input.contextTokens ?? current.host?.pi?.contextTokens,

@@ -3,6 +3,13 @@ import type { WriteFrequency } from "./config.js";
 
 const REDACT_PLACEHOLDER = "<REDACTED>";
 const CONTINUED_PREFIX = "[continued] ";
+const TRIVIAL_PROMPT_RE = /^(ok|yes|no|thanks|thank you|continue|next|done|sure|sounds good|got it)$/i;
+
+const STRIP_PATTERNS: RegExp[] = [
+  /\[Persistent memory\][\s\S]*?(?=\n\[[a-z]+\]|$)/g,
+  /<(?:antThinking|thinking|reasoning)>[\s\S]*?<\/(?:antThinking|thinking|reasoning)>/g,
+  /data:[^;]+;base64,[A-Za-z0-9+/=]{100,}/g,
+];
 
 const SECRET_PATTERNS: RegExp[] = [
   /(?:api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?([^\s'\"`,;}{]{8,})['\"]?/gi,
@@ -84,6 +91,10 @@ export interface RetainSummary {
   previews: string[];
 }
 
+export type RetainOutcome =
+  | { skipped: true; reason: string }
+  | { skipped: false; summary: RetainSummary };
+
 export interface DeliveredRetainNotice {
   handles: HindsightHandles;
   summary: RetainSummary;
@@ -100,13 +111,24 @@ const latestUserText = (messages: any[]): string => {
 
 const shouldRetainToGlobalBank = (messages: any[]): boolean => /(^|\s)#(global|me)(?=\s|$)/i.test(latestUserText(messages));
 
+export const shouldSkipRetain = (messages: any[]): { skip: boolean; reason?: string } => {
+  const prompt = latestUserText(messages).trim();
+  if (!prompt) return { skip: true, reason: "no prompt" };
+  if (prompt.length < 5) return { skip: true, reason: "too short" };
+  if (TRIVIAL_PROMPT_RE.test(prompt)) return { skip: true, reason: "trivial" };
+  if (/^(#nomem|#skip)(?=\s|$)/i.test(prompt)) return { skip: true, reason: "opt-out" };
+  return { skip: false };
+};
+
 const buildTurnSummary = (messages: any[]): string => {
   const userParts: string[] = [];
   const assistantParts: string[] = [];
 
   for (const message of messages) {
     if (!isConversationMessage(message)) continue;
-    const text = sanitizeCredentials(extractText(message.content));
+    let text = sanitizeCredentials(extractText(message.content));
+    for (const pattern of STRIP_PATTERNS) text = text.replace(pattern, "");
+    text = text.trim();
     if (!text) continue;
     if (message.role === "user") userParts.push(text);
     else assistantParts.push(text);
@@ -188,7 +210,10 @@ export class WriteScheduler {
       });
   }
 
-  async onTurnEnd(handles: HindsightHandles, messages: any[]): Promise<RetainSummary | null> {
+  async onTurnEnd(handles: HindsightHandles, messages: any[]): Promise<RetainOutcome | null> {
+    const skip = shouldSkipRetain(messages);
+    if (skip.skip) return { skipped: true, reason: skip.reason ?? "skipped" };
+
     const bankIds = [handles.bankId];
     if (handles.config.globalBankId && handles.config.globalBankId !== handles.bankId && shouldRetainToGlobalBank(messages)) {
       bankIds.push(handles.config.globalBankId);
@@ -211,25 +236,25 @@ export class WriteScheduler {
       writes.forEach((write, index) => {
         this.enqueueAsync({ handles, bankId: write.bankId, items: write.items, summary, notify: index === 0 });
       });
-      return summary;
+      return { skipped: false, summary };
     }
     if (this.frequency === "turn") {
       for (const write of writes) await this.sendWithRetry(handles, write.bankId, write.items);
-      return summary;
+      return { skipped: false, summary };
     }
     this.pending.push(...writes.map((write, index) => ({ handles, bankId: write.bankId, items: write.items, summary: { ...summary }, notify: index === 0 })));
     if (typeof this.frequency === "number") {
       if (this.turnCount % this.frequency === 0) {
         await this.flushPending();
-        return summary;
+        return { skipped: false, summary };
       }
       summary.mode = "queued";
-      return summary;
+      return { skipped: false, summary };
     }
     if (this.frequency === "session") {
       summary.mode = "queued";
     }
-    return summary;
+    return { skipped: false, summary };
   }
 
   private async flushPending(): Promise<void> {
