@@ -1,21 +1,27 @@
-import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
-import { tmpdir, homedir } from "node:os";
-import { join } from "node:path";
+import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { normalizeBankStrategy, normalizeRecallMode, normalizeRecallTypes, readConfigFile } from "../extensions/config.js";
+import { CONFIG_PATH, normalizeBankStrategy, normalizeRecallMode, normalizeRecallTypes, readConfigFile, resolveConfig, saveConfig } from "../extensions/config.js";
 import { deriveBankId, sanitizeBankId } from "../extensions/session.js";
 
 const tempDirs: string[] = [];
-const originalHome = process.env.HOME;
+let originalConfigContent: string | null = null;
+let originalConfigExisted = false;
 
 beforeEach(async () => {
-  const fakeHome = await mkdtemp(join(tmpdir(), "hindsight-home-"));
-  tempDirs.push(fakeHome);
-  process.env.HOME = fakeHome;
+  originalConfigExisted = existsSync(CONFIG_PATH);
+  originalConfigContent = originalConfigExisted ? await readFile(CONFIG_PATH, "utf8") : null;
 });
 
 afterEach(async () => {
-  process.env.HOME = originalHome;
+  if (originalConfigExisted && originalConfigContent !== null) {
+    await mkdir(dirname(CONFIG_PATH), { recursive: true });
+    await writeFile(CONFIG_PATH, originalConfigContent, "utf8");
+  } else {
+    await rm(CONFIG_PATH, { force: true });
+  }
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -44,7 +50,7 @@ describe("config file resolution", () => {
     const cwd = await mkdtemp(join(tmpdir(), "hindsight-pi-project-"));
     tempDirs.push(cwd);
 
-    const globalDir = join(homedir(), ".hindsight");
+    const globalDir = dirname(CONFIG_PATH);
     const localDir = join(cwd, ".hindsight");
     await mkdir(globalDir, { recursive: true });
     await mkdir(localDir, { recursive: true });
@@ -70,6 +76,45 @@ describe("config file resolution", () => {
     expect(merged?.host?.pi?.contextTokens).toBe(900);
     expect(merged?.mappings?.[cwd]).toBe("bank-local");
     expect(merged?.mappings?.["/global"]).toBe("bank-global");
+  });
+
+  it("project save does not overwrite global config or inject localhost baseUrl", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "hindsight-pi-project-"));
+    tempDirs.push(cwd);
+
+    const globalDir = dirname(CONFIG_PATH);
+    await mkdir(globalDir, { recursive: true });
+    await writeFile(join(globalDir, "config.json"), JSON.stringify({
+      baseUrl: "http://192.168.9.24:8888",
+      bankId: "global-bank",
+      host: { pi: { enabled: true, recallMode: "hybrid" } },
+    }));
+
+    await saveConfig({ showRecallIndicator: false }, { cwd, scope: "project" });
+
+    const globalSaved = JSON.parse(await readFile(join(globalDir, "config.json"), "utf8"));
+    const projectSaved = JSON.parse(await readFile(join(cwd, ".hindsight", "config.json"), "utf8"));
+    expect(globalSaved.baseUrl).toBe("http://192.168.9.24:8888");
+    expect(projectSaved.baseUrl).toBeUndefined();
+    expect(projectSaved.api_url).toBeUndefined();
+    expect(projectSaved.host?.pi?.showRecallIndicator).toBe(false);
+  });
+
+  it("defaults to manual strategy when explicit bankId exists", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "hindsight-pi-project-"));
+    tempDirs.push(cwd);
+
+    const localDir = join(cwd, ".hindsight");
+    await mkdir(localDir, { recursive: true });
+    await writeFile(join(localDir, "config.json"), JSON.stringify({
+      baseUrl: "http://192.168.9.24:8888",
+      bankId: "manual-bank",
+      host: { pi: { enabled: true } },
+    }));
+
+    const resolved = await resolveConfig(cwd);
+    expect(resolved.bankId).toBe("manual-bank");
+    expect(resolved.bankStrategy).toBe("manual");
   });
 });
 

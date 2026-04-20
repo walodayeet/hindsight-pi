@@ -1,5 +1,5 @@
 import type { HindsightHandles } from "./client.js";
-import type { WriteFrequency } from "./config.js";
+import type { RetainMode, WriteFrequency } from "./config.js";
 
 const REDACT_PLACEHOLDER = "<REDACTED>";
 const CONTINUED_PREFIX = "[continued] ";
@@ -85,6 +85,15 @@ interface PendingWrite {
   notify: boolean;
 }
 
+const cloneMessages = (messages: any[]): any[] => messages.map((message) => ({
+  ...message,
+  content: Array.isArray(message?.content)
+    ? message.content.map((entry: any) => (entry && typeof entry === "object" ? { ...entry } : entry))
+    : message?.content,
+}));
+
+const assistantOnlyMessages = (messages: any[]): any[] => messages.filter((message) => message?.role === "assistant");
+
 export interface RetainSummary {
   mode: "queued" | "saved";
   itemsCount: number;
@@ -166,10 +175,24 @@ const previewItems = (items: RetainItem[], limit = 3): string[] =>
     return text.length > 120 ? `${text.slice(0, 120)}…` : text;
   });
 
+export const countWorkUnits = (messages: any[]): number => {
+  let count = 0;
+  for (const message of messages) {
+    if (message?.role === "assistant") count += 1;
+    const content = Array.isArray(message?.content) ? message.content : [];
+    for (const block of content) {
+      if (block && typeof block === "object" && "type" in block && (block as any).type === "tool_use") count += 1;
+    }
+  }
+  return Math.max(count, 1);
+};
+
 export class WriteScheduler {
   private pending: PendingWrite[] = [];
-  private turnCount = 0;
+  private pendingTurns = 0;
+  private workCount = 0;
   private asyncQueue: Promise<void> = Promise.resolve();
+  private processBuffer: any[] = [];
 
   constructor(
     private frequency: WriteFrequency | number,
@@ -214,57 +237,108 @@ export class WriteScheduler {
       });
   }
 
+  private queuePending(writes: Array<{ bankId: string; items: RetainItem[] }>, handles: HindsightHandles, summary: RetainSummary): void {
+    this.pendingTurns += 1;
+    this.pending.push(...writes.map((write, index) => ({
+      handles,
+      bankId: write.bankId,
+      items: write.items,
+      summary,
+      notify: index === 0,
+    })));
+  }
+
   async onTurnEnd(handles: HindsightHandles, messages: any[]): Promise<RetainOutcome | null> {
     const skip = shouldSkipRetain(messages);
     if (skip.skip) return { skipped: true, reason: skip.reason ?? "skipped" };
+
+    const currentMessages = cloneMessages(messages);
+    this.processBuffer.push(...currentMessages);
+
+    const workUnits = countWorkUnits(messages);
+    const retainMode = (handles.config.retainMode ?? "response") as RetainMode;
+    const stepThreshold = handles.config.stepRetainThreshold ?? 5;
+    this.workCount += workUnits;
 
     const bankIds = [handles.bankId];
     if (handles.config.globalBankId && handles.config.globalBankId !== handles.bankId && shouldRetainToGlobalBank(messages)) {
       bankIds.push(handles.config.globalBankId);
     }
 
-    const base = toRetainItems(handles, messages, handles.bankId);
+    const stepTriggered = (retainMode === "step-batch" || retainMode === "both") && this.workCount >= stepThreshold;
+    if (stepTriggered) {
+      const stepWrites = bankIds
+        .map((bankId) => ({ bankId, items: toRetainItems(handles, this.processBuffer, bankId).items }))
+        .filter((entry) => entry.items.length > 0);
+      for (const write of stepWrites) await this.sendWithRetry(handles, write.bankId, write.items);
+      this.processBuffer = [];
+      this.workCount = 0;
+    }
+
+    let responseSource: any[] = [];
+    if (retainMode === "response") responseSource = currentMessages;
+    else if (retainMode === "both") responseSource = stepTriggered ? assistantOnlyMessages(currentMessages) : currentMessages;
+    else if (retainMode === "step-batch") return stepTriggered
+      ? {
+          skipped: false,
+          summary: {
+            mode: "saved",
+            itemsCount: bankIds
+              .map((bankId) => toRetainItems(handles, messages, bankId).items.length)
+              .reduce((sum, value) => sum + value, 0),
+            previews: previewItems(toRetainItems(handles, messages, handles.bankId).items),
+            fullText: toRetainItems(handles, messages, handles.bankId).summary,
+          },
+        }
+      : { skipped: true, reason: `below step threshold (${workUnits}/${stepThreshold})` };
+    else return { skipped: true, reason: "retain off" };
+
+    const base = toRetainItems(handles, responseSource, handles.bankId);
     const writes = bankIds
-      .map((bankId) => ({ bankId, items: toRetainItems(handles, messages, bankId).items }))
+      .map((bankId) => ({ bankId, items: toRetainItems(handles, responseSource, bankId).items }))
       .filter((entry) => entry.items.length > 0);
     if (writes.length === 0) return null;
 
-    const summary: RetainSummary = {
+    const savedSummary: RetainSummary = {
       mode: "saved",
       itemsCount: writes.reduce((count, entry) => count + entry.items.length, 0),
       previews: previewItems(writes[0]?.items ?? []),
       fullText: base.summary,
     };
+    const queuedSummary: RetainSummary = { ...savedSummary, mode: "queued" };
 
-    this.turnCount += 1;
     if (this.frequency === "async") {
-      summary.mode = "queued";
-      writes.forEach((write, index) => {
-        this.enqueueAsync({ handles, bankId: write.bankId, items: write.items, summary, notify: index === 0 });
-      });
-      return { skipped: false, summary };
+      writes.forEach((write, index) => this.enqueueAsync({
+        handles,
+        bankId: write.bankId,
+        items: write.items,
+        summary: queuedSummary,
+        notify: index === 0,
+      }));
+      return { skipped: false, summary: queuedSummary };
     }
-    if (this.frequency === "turn") {
-      for (const write of writes) await this.sendWithRetry(handles, write.bankId, write.items);
-      return { skipped: false, summary };
-    }
-    this.pending.push(...writes.map((write, index) => ({ handles, bankId: write.bankId, items: write.items, summary: { ...summary }, notify: index === 0 })));
-    if (typeof this.frequency === "number") {
-      if (this.turnCount % this.frequency === 0) {
-        await this.flushPending();
-        return { skipped: false, summary };
-      }
-      summary.mode = "queued";
-      return { skipped: false, summary };
-    }
+
     if (this.frequency === "session") {
-      summary.mode = "queued";
+      this.queuePending(writes, handles, queuedSummary);
+      return { skipped: false, summary: queuedSummary };
     }
-    return { skipped: false, summary };
+
+    if (typeof this.frequency === "number") {
+      this.queuePending(writes, handles, queuedSummary);
+      if (this.pendingTurns >= this.frequency) {
+        await this.flushPending();
+        return { skipped: false, summary: savedSummary };
+      }
+      return { skipped: false, summary: queuedSummary };
+    }
+
+    for (const write of writes) await this.sendWithRetry(handles, write.bankId, write.items);
+    return { skipped: false, summary: savedSummary };
   }
 
   private async flushPending(): Promise<void> {
     const batch = this.pending.splice(0);
+    this.pendingTurns = 0;
     for (const write of batch) {
       await this.sendWithRetry(write.handles, write.bankId, write.items);
       if (write.notify && write.summary.mode === "queued") {
@@ -283,7 +357,9 @@ export class WriteScheduler {
 
   reset(): void {
     this.pending = [];
-    this.turnCount = 0;
+    this.pendingTurns = 0;
+    this.workCount = 0;
+    this.processBuffer = [];
     this.asyncQueue = Promise.resolve();
   }
 }

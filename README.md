@@ -1,154 +1,386 @@
 # Hindsight-pi
 
-Hindsight-backed persistent memory extension for pi.
+Transparent, Hindsight-native persistent memory for pi.
 
-Status:
-- architecture complete
-- MVP extension scaffold implemented
-- local tests passing
-- smoke-tested against Hindsight at `http://192.168.9.24:8888`
+`Hindsight-pi` gives pi durable memory backed by Hindsight banks, with visible recall/retain signals, predictable config precedence, and controls for both simple and advanced workflows.
 
-## What It Does
+## Why this extension
 
-This extension gives pi durable memory through Hindsight memory banks.
+Most memory extensions optimize for magic. `Hindsight-pi` optimizes for clarity.
 
-Core behavior:
-- bootstraps `HindsightClient` on session start
-- maps current repo/session to deterministic Hindsight bank ID
-- injects concise recall-based memory into prompt context
-- uploads conversation turns back into Hindsight after agent completion
-- exposes explicit tools for raw search, synthesis, durable writes, and bank inspection
+What makes it different:
+- Hindsight-native bank model, not fake peer abstractions
+- visible memory lifecycle: you can see when memory loads and when memory is retained
+- global + project config hierarchy with source inspection
+- controllable recall and retain behavior
+- prompt-cache-friendlier defaults
+- explicit Hindsight tools for search, synthesis, retention, and bank inspection
 
-## Implemented Surface
+Best fit:
+- long-lived repo work
+- self-hosted Hindsight users
+- power users who want memory they can inspect and control
+- technical sessions where memory quality matters more than magic
 
-### Slash commands
-- `/hindsight:setup`
-- `/hindsight:status`
-- `/hindsight:config`
-- `/hindsight:doctor`
-- `/hindsight:mode`
-- `/hindsight:sync`
-- `/hindsight:map`
-- `/hindsight:recall`
-- `/hindsight:retain`
-- `/hindsight:settings`
+## Features
 
-### LLM tools
-- `hindsight_search`
-- `hindsight_context`
-- `hindsight_retain`
-- `hindsight_bank_profile`
-
-## Project Layout
-
-- `extensions/index.ts` — lifecycle wiring
-- `extensions/config.ts` — config loading and normalization
-- `extensions/client.ts` — Hindsight bootstrap and bank ensure
-- `extensions/session.ts` — bank ID derivation
-- `extensions/context.ts` — cached recall-driven prompt context
-- `extensions/upload.ts` — turn upload batching and sanitization
-- `extensions/tools.ts` — LLM-callable Hindsight tools
-- `extensions/commands.ts` — operator commands
-- `docs/` — architecture and contract docs
-- `tests/` — unit tests and smoke client script
+- durable memory via Hindsight banks
+- deterministic bank mapping per repo, directory, session, or manual bank ID
+- recall injected into agent prompt using Hindsight recall
+- explicit synthesis via Hindsight reflect-backed tool
+- visible, compact memory indicators
+- compact, non-revealing retain notifications
+- non-blocking async/session/batched retain modes
+- global config plus project-local override support
+- config source inspection with `/hindsight:where`
+- explicit tools:
+  - `hindsight_search`
+  - `hindsight_context`
+  - `hindsight_retain`
+  - `hindsight_bank_profile`
 
 ## Install
 
-From this repo:
-
-```bash
-cd G:/tmp/test/Hindsight-pi
-npm install
-```
-
-Load in pi for testing:
-
-```bash
-pi -e ./extensions/index.ts
-```
-
-Install as pi package from npm:
+Install from npm:
 
 ```bash
 pi install npm:@walodayeet/hindsight-pi
 ```
 
-Install as pi package from git:
+Install from GitHub:
 
 ```bash
 pi install git:github.com/walodayeet/pi-hindsight
 ```
 
-## Quick Setup for Current Hindsight Server
+Local dev load:
 
-Create `~/.hindsight/config.json`:
+```bash
+cd G:/tmp/test/Hindsight-pi
+npm install
+pi -e ./extensions/index.ts
+```
+
+## Quick start
+
+### 1. Start Hindsight server
+
+Example tested server:
+
+```text
+http://192.168.9.24:8888
+```
+
+### 2. Load extension in pi
+
+If installed from npm or git, restart pi or reload extensions.
+
+### 3. Run setup
+
+```text
+/hindsight:setup
+```
+
+Setup is intentionally basic:
+- enable Hindsight
+- set base URL
+- optional API key
+- choose bank style
+- choose recall mode
+- choose retain mode
+- choose save scope: global or project
+
+Everything else gets sane defaults.
+
+### 4. Verify
+
+```text
+/hindsight:doctor
+/hindsight:status
+/hindsight:where
+```
+
+## Default behavior
+
+Publish defaults aim for predictable, low-noise memory:
+
+- bank strategy: `manual` if explicit `bankId` exists, else `per-repo`
+- recall mode: `hybrid`
+- recall types: `observation,experience`
+- recall per type: `2`
+- recall display: `grouped`
+- injection frequency: `first-turn`
+- retain mode: `response`
+- step retain threshold: `5`
+- write frequency: `turn`
+- show recall indicator: `true`
+- show retain indicator: `true`
+- indicators in context: `false`
+
+## Commands
+
+Main commands:
+- `/hindsight:setup` — first-time setup
+- `/hindsight:settings` — edit settings; basic first, advanced optional
+- `/hindsight:status` — runtime and bank status
+- `/hindsight:doctor` — connectivity and bank preflight
+- `/hindsight:where` — show config sources and precedence
+- `/hindsight:sync` — refresh recall cache now
+- `/hindsight:map` — map current directory to explicit bank ID
+
+Supporting commands:
+- `/hindsight:config` — show effective resolved config
+- `/hindsight:connect` — reconnect now
+- `/hindsight:stats` — fetch bank stats if exposed by server
+- `/hindsight:mode` — quick recall mode switch
+
+## Tools
+
+Available to agent/tooling:
+- `hindsight_search` — raw memory search
+- `hindsight_context` — synthesized memory context
+- `hindsight_retain` — explicit durable write
+- `hindsight_bank_profile` — bank profile/insights
+
+## Config model
+
+`Hindsight-pi` supports both global and project-local config.
+
+Checked sources:
+- `~/.hindsight/config.toml`
+- `~/.hindsight/config.json`
+- parent `.../.hindsight/config.toml`
+- parent `.../.hindsight/config.json`
+
+Save targets used by extension UI:
+- global: `~/.hindsight/config.json`
+- project: `<repo>/.hindsight/config.json`
+
+Precedence:
+- project config overrides global for current repo
+- `/hindsight:where` shows exactly which files exist and what values they contribute
+
+### Example global config
 
 ```json
 {
-  "apiKey": "your-key",
   "baseUrl": "http://192.168.9.24:8888",
-  "bankStrategy": "per-repo",
   "bankId": "optional-manual-bank",
-  "globalBankId": "optional-global-bank",
-  "recallTypes": ["observation"],
+  "bankStrategy": "manual",
   "host": {
     "pi": {
       "enabled": true,
-      "workspace": "pi",
       "recallMode": "hybrid",
-      "recallTypes": ["observation"],
-      "autoCreateBank": true,
-      "contextTokens": 1200,
-      "contextRefreshTtlSeconds": 300,
-      "contextRefreshMessageThreshold": 8,
-      "contextCadence": 1,
-      "injectionFrequency": "every-turn",
-      "writeFrequency": "async",
-      "saveMessages": true,
-      "searchBudget": "mid",
-      "reflectBudget": "low",
-      "dialecticDynamic": true,
-      "reasoningLevel": "low",
-      "reasoningLevelCap": "medium",
-      "toolPreviewLength": 500,
-      "maxMessageLength": 25000,
+      "recallTypes": ["observation", "experience"],
+      "recallPerType": 2,
+      "recallDisplayMode": "grouped",
+      "injectionFrequency": "first-turn",
+      "retainMode": "response",
+      "stepRetainThreshold": 5,
+      "writeFrequency": "turn",
       "showRecallIndicator": true,
       "showRetainIndicator": true,
-      "indicatorsInContext": false,
-      "logging": true
+      "indicatorsInContext": false
     }
-  },
-  "mappings": {
-    "/abs/path/to/project": "manual-bank-id"
   }
 }
 ```
 
-Compat aliases from `pi-hindsight` also accepted in same file:
+### Compatibility aliases
+
+These aliases are also accepted:
 - `api_url` -> `baseUrl`
 - `api_key` -> `apiKey`
 - `bank_id` -> `bankId`
 - `global_bank` -> `globalBankId`
 - `recall_types` -> `recallTypes`
 
-Project-local override also supported:
-- `.hindsight/config.json`
-- local values override global values
+## Recall behavior
 
-Alternative interactive setup once loaded in pi:
+Recall uses Hindsight recall results to inject memory into prompt context.
+
+Key knobs:
+- `recallMode`
+  - `hybrid` — inject recall and keep tools available; recommended default
+  - `context` — rely on injected context only
+  - `tools` — no automatic prompt injection; use tools only
+  - `off` — disable recall
+- `recallTypes`
+  - `observation`
+  - `experience`
+  - `world`
+- `recallPerType`
+  - fetch this many snippets per selected type
+- `recallDisplayMode`
+  - `grouped` — inject grouped by type
+  - `unified` — inject one flattened list
+- `injectionFrequency`
+  - `first-turn` — prompt-cache-friendlier default
+  - `every-turn`
+
+User-facing recall notice stays compact:
 
 ```text
-/hindsight:setup
+🧠 Memory loaded (3 snippets)
 ```
 
-Recommended first checks:
+Full recalled content can still be injected internally when enabled.
+
+## Retain behavior
+
+Retain writes summarized conversation memory back into Hindsight.
+
+### Retain modes
+
+- `response`
+  - retain current turn summary
+- `step-batch`
+  - retain accumulated process buffer only when threshold reached
+- `both`
+  - if step batch fires, process retain saves accumulated buffer and response retain keeps assistant-only response to avoid duplicate full-turn retention
+  - otherwise retains normal full turn
+- `off`
+  - disable retain
+
+### Write frequencies
+
+- `turn`
+  - save immediately after response
+- `async`
+  - queue save asynchronously; non-blocking
+- `session`
+  - queue until session flush/end
+- numeric value like `5`
+  - queue and flush after that many turns
+
+### Retain indicators
+
+Compact retain notices use stable wording:
+- `Memory retained`
+- `Memory queued for async save`
+- `Memory queued for session end`
+- `Memory queued for N-turn batch`
+
+When `indicatorsInContext = false`, indicators stay visible to user without polluting agent context.
+
+## Common recipes
+
+### 1. Simple memory
+
+Use when you want strong defaults with minimal tuning.
+
+```json
+{
+  "baseUrl": "http://192.168.9.24:8888",
+  "host": {
+    "pi": {
+      "enabled": true,
+      "recallMode": "hybrid",
+      "retainMode": "response"
+    }
+  }
+}
+```
+
+### 2. Technical repo memory
+
+Use when doing longer engineering sessions and you want lower noise.
+
+```json
+{
+  "host": {
+    "pi": {
+      "recallMode": "hybrid",
+      "recallTypes": ["observation", "experience"],
+      "recallPerType": 2,
+      "recallDisplayMode": "grouped",
+      "injectionFrequency": "first-turn",
+      "retainMode": "response",
+      "writeFrequency": "turn"
+    }
+  }
+}
+```
+
+### 3. Minimal prompt-cache churn
+
+Use when prompt stability matters most.
+
+```json
+{
+  "host": {
+    "pi": {
+      "recallMode": "tools",
+      "injectionFrequency": "first-turn",
+      "showRecallIndicator": true,
+      "indicatorsInContext": false
+    }
+  }
+}
+```
+
+## Troubleshooting
+
+### Wrong base URL
+
+Run:
 
 ```text
-/hindsight:doctor
-/hindsight:status
+/hindsight:where
 ```
 
-## Development Commands
+If project config exists, it overrides global for current repo.
+
+### Wrong bank selected
+
+Check:
+- `/hindsight:status`
+- `/hindsight:where`
+
+If `bankId` exists, strategy defaults to `manual` unless explicitly changed.
+
+### Project config overriding global
+
+Expected behavior.
+
+Use:
+
+```text
+/hindsight:where
+```
+
+Then either:
+- edit `<repo>/.hindsight/config.json`
+- delete project config
+- or save future changes to global instead
+
+### Retain looks queued instead of saved
+
+Check `writeFrequency`:
+- `async` => queued for async delivery
+- `session` => queued until session end/flush
+- numeric => queued until threshold reached
+- `turn` => saved immediately
+
+### Connection fails with localhost
+
+Likely wrong config source won precedence.
+
+Run:
+
+```text
+/hindsight:where
+```
+
+Look for project config writing `http://localhost:8888`.
+
+## Session naming
+
+Extension uses workspace-style session names derived from current directory rather than renaming session to bank ID.
+
+## Development
+
+Commands:
 
 ```bash
 npm run typecheck
@@ -156,9 +388,43 @@ npm test
 npm run smoke
 ```
 
-## Verified Test Results
+Smoke test against real server:
 
-Passed locally:
+```bash
+HINDSIGHT_BASE_URL=http://192.168.9.24:8888 npm run smoke
+```
+
+## Release positioning
+
+`Hindsight-pi` aims to be:
+- most transparent Hindsight extension for pi
+- Hindsight-native, inspectable, controllable
+- good for serious long-lived repo work
+
+Not aiming to be:
+- most magical
+- most hidden
+- most minimal
+
+## Publish checklist
+
+Before release:
+- run `npm run typecheck`
+- run `npm test`
+- run smoke test against live Hindsight server
+- verify setup from empty config
+- verify global-only config
+- verify project-only config
+- verify project overrides global as expected
+- verify `/hindsight:where` output
+- verify recall compact notice
+- verify retain saved and queued notices
+- bump version
+- tag release
+
+## Verified locally
+
+Passed during development:
 
 ```bash
 npm run typecheck
@@ -166,62 +432,19 @@ npm test
 HINDSIGHT_BASE_URL=http://192.168.9.24:8888 npm run smoke
 ```
 
-Smoke test result:
-- connected successfully
-- ensured bank `hindsight-pi-smoke`
-- retained test memory
-- recalled that memory successfully
+## Project layout
 
-## Design Notes
+- `extensions/index.ts` — lifecycle wiring and indicators
+- `extensions/config.ts` — config loading, precedence, normalization, saving
+- `extensions/client.ts` — Hindsight bootstrap and bank creation
+- `extensions/session.ts` — bank/session naming logic
+- `extensions/context.ts` — recall cache and prompt rendering
+- `extensions/upload.ts` — retention batching, sanitization, write scheduling
+- `extensions/tools.ts` — explicit Hindsight tools
+- `extensions/commands.ts` — setup, settings, status, doctor, where
+- `docs/` — architecture and config notes
+- `tests/` — unit tests and smoke script
 
-Key design decisions:
-- Hindsight bank is primary durable unit
-- default bank strategy is `per-repo`
-- prompt injection uses `recall` by default
-- explicit synthesis uses `reflect`
-- mental models are optional later optimization, not MVP dependency
+## License
 
-See:
-- `docs/hindsight-api-notes.md`
-- `docs/architecture.md`
-- `docs/config.md`
-- `docs/commands-and-tools.md`
-
-## Publish
-
-Publish to npm:
-
-```bash
-npm login
-npm publish --access public
-```
-
-Push repo to GitHub:
-
-```bash
-git remote add origin https://github.com/walodayeet/pi-hindsight.git
-git add .
-git commit -m "Initial release: hindsight-pi"
-git push -u origin master
-```
-
-Package gallery notes:
-- package includes `pi-package` keyword for discovery
-- `pi.dev/packages` indexes npm packages and git-installable pi packages
-- after publish, install with `pi install npm:@walodayeet/hindsight-pi`
-
-## Release Readiness
-
-Ready for publish:
-- typecheck passes
-- tests pass
-- npm tarball verified with `npm pack --dry-run`
-- config contract covers global + local `config.json`
-- `pi-hindsight` compat aliases supported
-- taskplane artifacts ignored from publish/repo flow
-
-Future enhancements, not release blockers:
-- richer doctor/status diagnostics
-- stronger SDK typing instead of local shims
-- more selective upload summarization for noisy tool-heavy sessions
-- optional mental-model support
+MIT

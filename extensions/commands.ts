@@ -10,6 +10,8 @@ import {
   normalizeRecallMode,
   normalizeReasoningLevel,
   normalizeRecallTypes,
+  normalizeBaseUrl,
+  inspectConfigSources,
   resolveConfig,
   saveConfig,
   setRecallMode,
@@ -38,91 +40,285 @@ const hinted = (label: string, current: string, recommendation?: string): string
   const suffix = recommendation ? ` Recommended: ${recommendation}.` : "";
   return `${label}\nEnter without typing keeps/selects current value: ${current}.${suffix}`;
 };
+const uniqueOptions = (current: string | undefined, options: string[]): string[] => {
+  const seen = new Set<string>();
+  const ordered = [current, ...options].filter((value): value is string => Boolean(value));
+  return ordered.filter((value) => {
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
+};
+type WizardAction<T> =
+  | { kind: "next"; value: T }
+  | { kind: "back" }
+  | { kind: "abort" };
+
+const BACK = "← Back";
+const ABORT = "✕ Abort setup";
+const KEEP = "Keep current value";
+const EDIT = "Edit value";
+const boolLabel = (value: boolean): string => value ? "on" : "off";
+
+const selectWizardAction = async (
+  ctx: ExtensionContext,
+  title: string,
+  options: string[],
+  allowBack = true,
+): Promise<WizardAction<string>> => {
+  const choice = await ctx.ui.select(title, [...options, ...(allowBack ? [BACK] : []), ABORT]);
+  if (!choice || choice === ABORT) return { kind: "abort" };
+  if (choice === BACK) return { kind: "back" };
+  return { kind: "next", value: choice };
+};
+
+const inputWizardAction = async (
+  ctx: ExtensionContext,
+  title: string,
+  current: string,
+  recommendation?: string,
+  allowBack = true,
+): Promise<WizardAction<string>> => {
+  const mode = await ctx.ui.select(
+    `${title}\nCurrent: ${current || "(blank)"}${recommendation ? `\nRecommended: ${recommendation}` : ""}`,
+    [KEEP, EDIT, ...(allowBack ? [BACK] : []), ABORT],
+  );
+  if (!mode || mode === ABORT) return { kind: "abort" };
+  if (mode === BACK) return { kind: "back" };
+  if (mode === KEEP) return { kind: "next", value: current };
+  const value = await ctx.ui.input(hinted(title, current || "(blank)", recommendation), current);
+  if (value === undefined) return { kind: "abort" };
+  return { kind: "next", value };
+};
+
+const confirmWizardAction = async (
+  ctx: ExtensionContext,
+  title: string,
+  current: boolean,
+  recommendation?: string,
+  allowBack = true,
+): Promise<WizardAction<boolean>> => {
+  const choice = await ctx.ui.select(
+    `${title}\nCurrent: ${boolLabel(current)}${recommendation ? `\nRecommended: ${recommendation}` : ""}`,
+    [boolLabel(current), ...uniqueOptions(undefined, ["on", "off"]).filter((value) => value !== boolLabel(current)), ...(allowBack ? [BACK] : []), ABORT],
+  );
+  if (!choice || choice === ABORT) return { kind: "abort" };
+  if (choice === BACK) return { kind: "back" };
+  return { kind: "next", value: choice === "on" };
+};
+
+const chooseRecallTypes = async (ctx: ExtensionContext, existing: readonly string[], allowBack = true): Promise<WizardAction<string>> => {
+  let selected = new Set(normalizeRecallTypes(existing));
+  const all: RecallType[] = ["observation", "experience", "world"];
+
+  while (true) {
+    const summary = all.map((type) => `${selected.has(type) ? "[x]" : "[ ]"} ${type}`).join("\n");
+    const choice = await ctx.ui.select(
+      `Recall types\nRecommended: observation for focused recall; observation,experience for richer recall\nCurrent:\n${summary}`,
+      [
+        ...all.map((type) => `${selected.has(type) ? "[x]" : "[ ]"} ${type}`),
+        "Done",
+        ...(allowBack ? [BACK] : []),
+        ABORT,
+      ],
+    );
+
+    if (!choice || choice === ABORT) return { kind: "abort" };
+    if (choice === BACK) return { kind: "back" };
+    if (choice === "Done") {
+      const normalized = normalizeRecallTypes([...selected]);
+      return { kind: "next", value: normalized.join(",") };
+    }
+
+    const type = choice.replace(/^\[[ x]\]\s*/, "") as RecallType;
+    if (selected.has(type)) selected.delete(type);
+    else selected.add(type);
+    if (selected.size === 0) selected.add("observation");
+  }
+};
+
+const describeConfigState = async (ctx: ExtensionContext): Promise<{ globalExists: boolean; projectExists: boolean; projectOverrides: boolean; summary: string }> => {
+  const sources = await inspectConfigSources(ctx.cwd);
+  const globalExists = sources.some((source) => source.exists && (source.kind === "global-json" || source.kind === "global-toml"));
+  const projectExists = sources.some((source) => source.exists && (source.kind === "project-json" || source.kind === "project-toml"));
+  return {
+    globalExists,
+    projectExists,
+    projectOverrides: projectExists,
+    summary: projectExists
+      ? "Config: project overrides global for this repo"
+      : globalExists
+        ? "Config: global only"
+        : "Config: no saved config yet",
+  };
+};
+
+const chooseConfigScope = async (ctx: ExtensionContext, allowBack = true): Promise<WizardAction<"global" | "project">> => {
+  const state = await describeConfigState(ctx);
+  const choice = await selectWizardAction(ctx, `Where should this change be saved?\n${state.summary}`, [
+    `Global (~/.hindsight/config.json)`,
+    `Project (${ctx.cwd}/.hindsight/config.json)`,
+  ], allowBack);
+  if (choice.kind !== "next") return choice;
+  return { kind: "next", value: choice.value.startsWith("Project") ? "project" : "global" };
+};
+
+const chooseScopeNow = async (ctx: ExtensionContext): Promise<"global" | "project" | null> => {
+  const result = await chooseConfigScope(ctx, false);
+  if (result.kind !== "next") return null;
+  if (result.value === "project") ctx.ui.notify("Project config will override global settings for this repo.", "warning");
+  return result.value;
+};
+
+const runStepLoop = async <T extends object>(
+  ctx: ExtensionContext,
+  steps: Array<(state: T, allowBack: boolean) => Promise<WizardAction<Partial<T>>>>,
+  initial: T,
+): Promise<T | undefined> => {
+  const state = { ...initial };
+  let index = 0;
+  while (index < steps.length) {
+    const result = await steps[index](state, index > 0);
+    if (result.kind === "abort") {
+      ctx.ui.notify("Setup aborted. No changes saved.", "warning");
+      return undefined;
+    }
+    if (result.kind === "back") {
+      index = Math.max(0, index - 1);
+      continue;
+    }
+    Object.assign(state, result.value);
+    index += 1;
+  }
+  return state;
+};
+
 const runSetupWizard = async (ctx: ExtensionContext): Promise<void> => {
   const existing = await resolveConfig(ctx.cwd);
-  const enabledInput = await ctx.ui.input(hinted("Enable Hindsight (true/false)", existing.enabled ? "true" : "false", "true if you have Hindsight running"), existing.enabled ? "true" : "false");
-  const baseUrl = await ctx.ui.input(hinted("Hindsight base URL", existing.baseUrl || "http://localhost:8888", "http://localhost:8888 for local server"), existing.baseUrl || "http://localhost:8888");
-  const apiKeyInput = await ctx.ui.input(hinted("Hindsight API key (optional for local)", mask(existing.apiKey), "blank for local/self-hosted without auth"), mask(existing.apiKey));
-  const workspace = await ctx.ui.input(hinted("Workspace label", existing.workspace, "pi"), existing.workspace);
-  const linkedHostsInput = await ctx.ui.input(hinted("Linked host bank aliases (comma-separated, optional)", existing.linkedHosts.join(", ") || "(none)", "blank unless you use multiple Hindsight hosts"), existing.linkedHosts.join(", "));
-  const bankStrategyInput = await ctx.ui.input(hinted("Bank strategy", existing.bankStrategy, "per-repo for most users"), existing.bankStrategy);
-  const manualBankId = await ctx.ui.input(hinted("Manual bank ID (optional)", existing.bankId ?? "(blank)", "blank unless using manual strategy"), existing.bankId ?? "");
-  const globalBankIdInput = await ctx.ui.input(hinted("Global bank ID (optional, for shared memory)", existing.globalBankId ?? "(blank)", "blank unless you want cross-project pool"), existing.globalBankId ?? "");
-  const recallModeInput = await ctx.ui.input(hinted("Recall mode (hybrid/context/tools/off)", existing.recallMode, "hybrid for most users; tools if you want max prompt-cache stability"), existing.recallMode);
-  const recallTypesInput = await ctx.ui.input(hinted("Recall types (observation,experience,world)", existing.recallTypes.join(","), "observation for focused recall; observation,experience for richer recall"), existing.recallTypes.join(","));
-  const autoCreateBankInput = await ctx.ui.input(hinted("Auto-create banks (true/false)", existing.autoCreateBank ? "true" : "false", "true for easiest onboarding"), existing.autoCreateBank ? "true" : "false");
-  const writeFrequencyInput = await ctx.ui.input(hinted("Write frequency (async/turn/session/or positive integer)", String(existing.writeFrequency), "5 for technical chats, turn for immediate save after every response"), String(existing.writeFrequency));
-  const saveMessagesInput = await ctx.ui.input(hinted("Save messages (true/false)", existing.saveMessages ? "true" : "false", "true"), existing.saveMessages ? "true" : "false");
-  const recallIndicatorInput = await ctx.ui.input(hinted("Show recall indicator (true/false)", existing.showRecallIndicator ? "true" : "false", "true"), existing.showRecallIndicator ? "true" : "false");
-  const retainIndicatorInput = await ctx.ui.input(hinted("Show retain indicator (true/false)", existing.showRetainIndicator ? "true" : "false", "true"), existing.showRetainIndicator ? "true" : "false");
-  const indicatorsInContextInput = await ctx.ui.input(hinted("Keep indicators in conversation context (true/false)", existing.indicatorsInContext ? "true" : "false", "false so hints stay UI-only"), existing.indicatorsInContext ? "true" : "false");
-  await ctx.ui.notify("Session naming left to pi default. Extension no longer renames sessions.", "info");
-  const reasoningLevelInput = await ctx.ui.input(hinted("Reflect reasoning level (low/medium/high)", existing.reasoningLevel, "low for cost-friendly default"), existing.reasoningLevel);
-  const reasoningCapInput = await ctx.ui.input(hinted("Reflect reasoning cap (blank/low/medium/high)", existing.reasoningLevelCap ?? "(blank)", "blank or medium"), existing.reasoningLevelCap ?? "");
-  const dynamicInput = await ctx.ui.input(hinted("Reflect dynamic budget bump (true/false)", existing.dialecticDynamic ? "true" : "false", "true"), existing.dialecticDynamic ? "true" : "false");
-  const toolPreviewLengthInput = await ctx.ui.input(hinted("Tool preview length", String(existing.toolPreviewLength), "500"), String(existing.toolPreviewLength));
+  const scopeChoice = await chooseConfigScope(ctx, false);
+  if (scopeChoice.kind !== "next") return;
+  if (scopeChoice.value === "project") ctx.ui.notify("Project config will override global settings for this repo.", "warning");
+
+  const enabled = await ctx.ui.confirm("Enable Hindsight?", `Current: ${boolLabel(existing.enabled)}`);
+  const baseUrl = await ctx.ui.input("Hindsight base URL", existing.baseUrl);
+  const apiKeyInput = await ctx.ui.input("Hindsight API key (optional)", existing.apiKey ?? "");
+  const bankStrategyInput = await ctx.ui.select("Bank selection", ["Use fixed bank ID", "Use per-repo derived bank"]);
+  const manualBankId = bankStrategyInput === "Use fixed bank ID"
+    ? await ctx.ui.input("Bank ID", existing.bankId ?? "")
+    : "";
+  const recallModeInput = await ctx.ui.select("Recall mode", ["hybrid", "context", "tools", "off"]);
+  const retainModeInput = await ctx.ui.select("Retain mode", ["response", "step-batch", "both", "off"]);
 
   await saveConfig({
-    enabled: parseBool(enabledInput, existing.enabled),
-    apiKey: apiKeyInput && apiKeyInput !== mask(existing.apiKey) ? apiKeyInput : existing.apiKey,
-    baseUrl: baseUrl ?? existing.baseUrl,
+    enabled,
+    apiKey: apiKeyInput || undefined,
+    baseUrl: normalizeBaseUrl(baseUrl ?? existing.baseUrl),
     bankId: manualBankId || undefined,
-    globalBankId: globalBankIdInput || undefined,
-    bankStrategy: normalizeBankStrategy(bankStrategyInput) as BankStrategy,
+    bankStrategy: bankStrategyInput === "Use fixed bank ID" ? "manual" : "per-repo",
     recallMode: normalizeRecallMode(recallModeInput) as RecallMode,
-    recallTypes: normalizeRecallTypes(parseCsv(recallTypesInput)) as RecallType[],
-    autoCreateBank: parseBool(autoCreateBankInput, existing.autoCreateBank),
-    workspace: workspace ?? existing.workspace,
-    linkedHosts: parseCsv(linkedHostsInput),
-    saveMessages: parseBool(saveMessagesInput, existing.saveMessages),
-    writeFrequency: parseWriteFrequency(writeFrequencyInput, existing.writeFrequency),
-    showRecallIndicator: parseBool(recallIndicatorInput, existing.showRecallIndicator),
-    showRetainIndicator: parseBool(retainIndicatorInput, existing.showRetainIndicator),
-    indicatorsInContext: parseBool(indicatorsInContextInput, existing.indicatorsInContext),
-    renameSessionToBank: false,
-    reasoningLevel: normalizeReasoningLevel(reasoningLevelInput) as ReasoningLevel,
-    reasoningLevelCap: reasoningCapInput?.trim() ? normalizeReasoningLevel(reasoningCapInput) as ReasoningLevel : null,
-    dialecticDynamic: parseBool(dynamicInput, existing.dialecticDynamic),
-    toolPreviewLength: parsePositiveInt(toolPreviewLengthInput, existing.toolPreviewLength),
-  });
+    recallTypes: ["observation", "experience"],
+    recallPerType: 2,
+    recallDisplayMode: "grouped",
+    injectionFrequency: "first-turn",
+    retainMode: retainModeInput as any,
+    stepRetainThreshold: 5,
+    writeFrequency: "turn",
+    showRecallIndicator: true,
+    showRetainIndicator: true,
+    indicatorsInContext: false,
+  }, { cwd: ctx.cwd, scope: scopeChoice.value });
 
   await connect(ctx);
-  ctx.ui.notify("Hindsight config saved. Recommended default for most users: per-repo + hybrid + writeFrequency=5 + indicatorsInContext=false.", "success");
+  ctx.ui.notify("Hindsight basic setup saved. Advanced settings remain optional.", "success");
 };
 
 const runRecallWizard = async (ctx: ExtensionContext): Promise<void> => {
   const existing = await resolveConfig(ctx.cwd);
-  const recallModeInput = await ctx.ui.input(hinted("Recall mode (hybrid/context/tools/off)", existing.recallMode, "hybrid for most users; tools for best prompt-cache stability"), existing.recallMode);
-  const recallTypesInput = await ctx.ui.input(hinted("Recall types (observation,experience,world)", existing.recallTypes.join(","), "observation or observation,experience"), existing.recallTypes.join(","));
-  const searchBudgetInput = await ctx.ui.input(hinted("Search budget (low/mid/high)", existing.searchBudget, "mid"), existing.searchBudget);
-  const reflectBudgetInput = await ctx.ui.input(hinted("Reflect budget (low/mid/high)", existing.reflectBudget, "low for cost-friendly default"), existing.reflectBudget);
-  const contextTokensInput = await ctx.ui.input(hinted("Context tokens", String(existing.contextTokens), "1200"), String(existing.contextTokens));
-  const ttlInput = await ctx.ui.input(hinted("Context TTL seconds", String(existing.contextRefreshTtlSeconds), "300"), String(existing.contextRefreshTtlSeconds));
-  const cadenceInput = await ctx.ui.input(hinted("Context cadence turns", String(existing.contextCadence), "1 for freshest recall, 3-5 for long technical sessions"), String(existing.contextCadence));
-  const thresholdInput = await ctx.ui.input(hinted("Refresh after N uploaded turns/messages threshold", String(existing.contextRefreshMessageThreshold), "8"), String(existing.contextRefreshMessageThreshold));
-  const injectionInput = await ctx.ui.input(hinted("Injection frequency (every-turn/first-turn)", existing.injectionFrequency, "first-turn if you care about prompt caching"), existing.injectionFrequency);
-  const recallIndicatorInput = await ctx.ui.input(hinted("Show recall indicator (true/false)", existing.showRecallIndicator ? "true" : "false", "true"), existing.showRecallIndicator ? "true" : "false");
-  const indicatorsInContextInput = await ctx.ui.input(hinted("Keep indicators in conversation context (true/false)", existing.indicatorsInContext ? "true" : "false", "false"), existing.indicatorsInContext ? "true" : "false");
-  const reasoningInput = await ctx.ui.input(hinted("Reflect reasoning level (low/medium/high)", existing.reasoningLevel, "low"), existing.reasoningLevel);
-  const reasoningCapInput = await ctx.ui.input(hinted("Reflect reasoning cap (blank/low/medium/high)", existing.reasoningLevelCap ?? "(blank)", "blank or medium"), existing.reasoningLevelCap ?? "");
-  const dynamicInput = await ctx.ui.input(hinted("Reflect dynamic budget bump (true/false)", existing.dialecticDynamic ? "true" : "false", "true"), existing.dialecticDynamic ? "true" : "false");
+  const draft = await runStepLoop(ctx, [
+    async (_state, allowBack) => {
+      const result = await chooseRecallTypes(ctx, existing.recallTypes, allowBack);
+      return result.kind === "next" ? { kind: "next", value: { recallTypesInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await inputWizardAction(ctx, "Recall count per type", String(existing.recallPerType), "2", allowBack);
+      return result.kind === "next" ? { kind: "next", value: { recallPerTypeInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await selectWizardAction(ctx, "Recall display mode", uniqueOptions(existing.recallDisplayMode, ["grouped", "unified"]), allowBack);
+      return result.kind === "next" ? { kind: "next", value: { recallDisplayInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await selectWizardAction(ctx, "Search budget\nRecommended: mid", uniqueOptions(existing.searchBudget, ["low", "mid", "high"]), allowBack);
+      return result.kind === "next" ? { kind: "next", value: { searchBudgetInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await selectWizardAction(ctx, "Reflect budget\nRecommended: low", uniqueOptions(existing.reflectBudget, ["low", "mid", "high"]), allowBack);
+      return result.kind === "next" ? { kind: "next", value: { reflectBudgetInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await inputWizardAction(ctx, "Context tokens", String(existing.contextTokens), "1200", allowBack);
+      return result.kind === "next" ? { kind: "next", value: { contextTokensInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await inputWizardAction(ctx, "Context TTL seconds", String(existing.contextRefreshTtlSeconds), "300", allowBack);
+      return result.kind === "next" ? { kind: "next", value: { ttlInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await inputWizardAction(ctx, "Context cadence turns", String(existing.contextCadence), "1 for freshest recall, 3-5 for long technical sessions", allowBack);
+      return result.kind === "next" ? { kind: "next", value: { cadenceInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await inputWizardAction(ctx, "Refresh after N uploaded turns/messages threshold", String(existing.contextRefreshMessageThreshold), "8", allowBack);
+      return result.kind === "next" ? { kind: "next", value: { thresholdInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await selectWizardAction(ctx, "Injection frequency\nRecommended: first-turn if you care about prompt caching", uniqueOptions(existing.injectionFrequency, ["first-turn", "every-turn"]), allowBack);
+      return result.kind === "next" ? { kind: "next", value: { injectionInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await confirmWizardAction(ctx, "Show recall indicator?", existing.showRecallIndicator, undefined, allowBack);
+      return result.kind === "next" ? { kind: "next", value: { recallIndicator: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await confirmWizardAction(ctx, "Keep indicators in conversation context?", existing.indicatorsInContext, "off.", allowBack);
+      return result.kind === "next" ? { kind: "next", value: { indicatorsInContext: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await selectWizardAction(ctx, "Reflect reasoning level", uniqueOptions(existing.reasoningLevel, ["low", "medium", "high"]), allowBack);
+      return result.kind === "next" ? { kind: "next", value: { reasoningInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await selectWizardAction(ctx, "Reflect reasoning cap", uniqueOptions(existing.reasoningLevelCap ?? "(blank)", ["low", "medium", "high", "(blank)"]), allowBack);
+      return result.kind === "next" ? { kind: "next", value: { reasoningCapInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await confirmWizardAction(ctx, "Enable dynamic reflect budget bump?", existing.dialecticDynamic, undefined, allowBack);
+      return result.kind === "next" ? { kind: "next", value: { dynamic: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await chooseConfigScope(ctx, allowBack);
+      return result.kind === "next" ? { kind: "next", value: { scope: result.value } } : result;
+    },
+  ], {} as any);
+  if (!draft) return;
 
   await saveConfig({
-    recallMode: normalizeRecallMode(recallModeInput),
-    recallTypes: normalizeRecallTypes(parseCsv(recallTypesInput)),
-    searchBudget: searchBudgetInput === "low" || searchBudgetInput === "high" ? searchBudgetInput : "mid",
-    reflectBudget: reflectBudgetInput === "mid" || reflectBudgetInput === "high" ? reflectBudgetInput : "low",
-    contextTokens: parsePositiveInt(contextTokensInput, existing.contextTokens),
-    contextRefreshTtlSeconds: parsePositiveInt(ttlInput, existing.contextRefreshTtlSeconds),
-    contextCadence: parsePositiveInt(cadenceInput, existing.contextCadence),
-    contextRefreshMessageThreshold: parsePositiveInt(thresholdInput, existing.contextRefreshMessageThreshold),
-    injectionFrequency: injectionInput === "first-turn" ? "first-turn" : "every-turn",
-    showRecallIndicator: parseBool(recallIndicatorInput, existing.showRecallIndicator),
-    indicatorsInContext: parseBool(indicatorsInContextInput, existing.indicatorsInContext),
-    reasoningLevel: normalizeReasoningLevel(reasoningInput),
-    reasoningLevelCap: reasoningCapInput?.trim() ? normalizeReasoningLevel(reasoningCapInput) : null,
-    dialecticDynamic: parseBool(dynamicInput, existing.dialecticDynamic),
-  });
+    recallTypes: normalizeRecallTypes(parseCsv(draft.recallTypesInput)),
+    recallPerType: parsePositiveInt(draft.recallPerTypeInput, existing.recallPerType),
+    recallDisplayMode: draft.recallDisplayInput === "unified" ? "unified" : "grouped",
+    searchBudget: draft.searchBudgetInput === "low" || draft.searchBudgetInput === "high" ? draft.searchBudgetInput : "mid",
+    reflectBudget: draft.reflectBudgetInput === "mid" || draft.reflectBudgetInput === "high" ? draft.reflectBudgetInput : "low",
+    contextTokens: parsePositiveInt(draft.contextTokensInput, existing.contextTokens),
+    contextRefreshTtlSeconds: parsePositiveInt(draft.ttlInput, existing.contextRefreshTtlSeconds),
+    contextCadence: parsePositiveInt(draft.cadenceInput, existing.contextCadence),
+    contextRefreshMessageThreshold: parsePositiveInt(draft.thresholdInput, existing.contextRefreshMessageThreshold),
+    injectionFrequency: draft.injectionInput === "first-turn" ? "first-turn" : "every-turn",
+    showRecallIndicator: draft.recallIndicator,
+    indicatorsInContext: draft.indicatorsInContext,
+    reasoningLevel: normalizeReasoningLevel(draft.reasoningInput),
+    reasoningLevelCap: draft.reasoningCapInput === "(blank)" ? null : normalizeReasoningLevel(draft.reasoningCapInput),
+    dialecticDynamic: draft.dynamic,
+  }, { cwd: ctx.cwd, scope: draft.scope });
   const updated = await resolveConfig(ctx.cwd);
   setRecallMode(updated.recallMode);
   await connect(ctx);
@@ -131,47 +327,149 @@ const runRecallWizard = async (ctx: ExtensionContext): Promise<void> => {
 
 const runRetainWizard = async (ctx: ExtensionContext): Promise<void> => {
   const existing = await resolveConfig(ctx.cwd);
-  const writeFrequencyInput = await ctx.ui.input(hinted("Write frequency (async/turn/session/or positive integer)", String(existing.writeFrequency), "5 for technical chats, turn for instant save per response"), String(existing.writeFrequency));
-  const saveMessagesInput = await ctx.ui.input(hinted("Save messages (true/false)", existing.saveMessages ? "true" : "false", "true"), existing.saveMessages ? "true" : "false");
-  const retainIndicatorInput = await ctx.ui.input(hinted("Show retain indicator (true/false)", existing.showRetainIndicator ? "true" : "false", "true"), existing.showRetainIndicator ? "true" : "false");
-  const indicatorsInContextInput = await ctx.ui.input(hinted("Keep indicators in conversation context (true/false)", existing.indicatorsInContext ? "true" : "false", "false"), existing.indicatorsInContext ? "true" : "false");
-  const maxMessageLengthInput = await ctx.ui.input(hinted("Max message length", String(existing.maxMessageLength), "25000"), String(existing.maxMessageLength));
-  const toolPreviewLengthInput = await ctx.ui.input(hinted("Tool preview length", String(existing.toolPreviewLength), "500"), String(existing.toolPreviewLength));
+  const draft = await runStepLoop(ctx, [
+    async (_state, allowBack) => {
+      const result = await inputWizardAction(ctx, "Step retain threshold", String(existing.stepRetainThreshold), "5", allowBack);
+      return result.kind === "next" ? { kind: "next", value: { stepThresholdInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await selectWizardAction(ctx, "Write frequency\nRecommended: turn for simplest behavior; async for non-blocking saves", uniqueOptions(String(existing.writeFrequency), ["turn", "async", "session", "5"]), allowBack);
+      return result.kind === "next" ? { kind: "next", value: { writeFrequencyInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await confirmWizardAction(ctx, "Save messages automatically?", existing.saveMessages, undefined, allowBack);
+      return result.kind === "next" ? { kind: "next", value: { saveMessages: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await confirmWizardAction(ctx, "Show retain indicator?", existing.showRetainIndicator, undefined, allowBack);
+      return result.kind === "next" ? { kind: "next", value: { showRetainIndicator: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await confirmWizardAction(ctx, "Keep indicators in conversation context?", existing.indicatorsInContext, "off.", allowBack);
+      return result.kind === "next" ? { kind: "next", value: { indicatorsInContext: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await inputWizardAction(ctx, "Max message length", String(existing.maxMessageLength), "25000", allowBack);
+      return result.kind === "next" ? { kind: "next", value: { maxMessageLengthInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await inputWizardAction(ctx, "Tool preview length", String(existing.toolPreviewLength), "500", allowBack);
+      return result.kind === "next" ? { kind: "next", value: { toolPreviewLengthInput: result.value } } : result;
+    },
+    async (_state, allowBack) => {
+      const result = await chooseConfigScope(ctx, allowBack);
+      return result.kind === "next" ? { kind: "next", value: { scope: result.value } } : result;
+    },
+  ], {} as any);
+  if (!draft) return;
 
   await saveConfig({
-    writeFrequency: parseWriteFrequency(writeFrequencyInput, existing.writeFrequency),
-    saveMessages: parseBool(saveMessagesInput, existing.saveMessages),
-    showRetainIndicator: parseBool(retainIndicatorInput, existing.showRetainIndicator),
-    indicatorsInContext: parseBool(indicatorsInContextInput, existing.indicatorsInContext),
-    toolPreviewLength: parsePositiveInt(toolPreviewLengthInput, existing.toolPreviewLength),
-    maxMessageLength: parsePositiveInt(maxMessageLengthInput, existing.maxMessageLength),
-  });
+    stepRetainThreshold: parsePositiveInt(draft.stepThresholdInput, existing.stepRetainThreshold),
+    writeFrequency: parseWriteFrequency(draft.writeFrequencyInput, existing.writeFrequency),
+    saveMessages: draft.saveMessages,
+    showRetainIndicator: draft.showRetainIndicator,
+    indicatorsInContext: draft.indicatorsInContext,
+    toolPreviewLength: parsePositiveInt(draft.toolPreviewLengthInput, existing.toolPreviewLength),
+    maxMessageLength: parsePositiveInt(draft.maxMessageLengthInput, existing.maxMessageLength),
+  }, { cwd: ctx.cwd, scope: draft.scope });
   const updated = await resolveConfig(ctx.cwd);
   await connect(ctx);
   ctx.ui.notify(`Retain settings saved: write=${updated.writeFrequency}, saveMessages=${updated.saveMessages ? "yes" : "no"}`, "success");
 };
 
 const runConfigTui = async (ctx: ExtensionContext): Promise<void> => {
-  const choice = await ctx.ui.select("Hindsight config", [
-    "Guided setup",
-    "Recall settings",
-    "Retain settings",
-    "Show current settings",
-    "Connect now",
-  ]);
-  if (choice === "Guided setup") return runSetupWizard(ctx);
-  if (choice === "Recall settings") return runRecallWizard(ctx);
-  if (choice === "Retain settings") return runRetainWizard(ctx);
-  if (choice === "Show current settings") return ctx.ui.notify(await statusText(ctx), "info");
-  if (choice === "Connect now") return connect(ctx).then(() => ctx.ui.notify("Hindsight connected and cache refreshed.", "success"));
+  while (true) {
+    const config = await resolveConfig(ctx.cwd);
+    const configState = await describeConfigState(ctx);
+    const choice = await ctx.ui.select(`Hindsight settings\n${configState.summary}\nBasic settings first. Advanced settings optional.`, [
+      `Enabled: ${boolLabel(config.enabled)}`,
+      `Base URL: ${config.baseUrl}`,
+      `Bank strategy: ${config.bankStrategy}`,
+      `Bank ID: ${config.bankId ?? "(none)"}`,
+      `Recall mode: ${config.recallMode}`,
+      `Retain mode: ${config.retainMode}`,
+      `Advanced recall settings…`,
+      `Advanced retain settings…`,
+      `Show config sources`,
+      `Connect now`,
+      `Exit`,
+    ]);
+    if (!choice || choice === "Exit") return;
+    if (choice === "Connect now") {
+      await connect(ctx);
+      ctx.ui.notify("Hindsight connected and cache refreshed.", "success");
+      continue;
+    }
+    if (choice === "Show config sources") {
+      const sources = await inspectConfigSources(ctx.cwd);
+      const lines = [configState.summary, ""];
+      for (const source of sources) lines.push(`${source.exists ? "✓" : "-"} ${source.kind}: ${source.path}`);
+      ctx.ui.notify(lines.join("\n"), "info");
+      continue;
+    }
+    if (choice === "Advanced recall settings…") {
+      await runRecallWizard(ctx);
+      continue;
+    }
+    if (choice === "Advanced retain settings…") {
+      await runRetainWizard(ctx);
+      continue;
+    }
+
+    const scope = await chooseScopeNow(ctx);
+    if (!scope) return;
+
+    if (choice.startsWith("Enabled:")) {
+      await saveConfig({ enabled: await ctx.ui.confirm("Enable Hindsight?", `Current: ${boolLabel(config.enabled)}`) }, { cwd: ctx.cwd, scope });
+    } else if (choice.startsWith("Base URL:")) {
+      const value = await ctx.ui.input("Hindsight base URL", config.baseUrl);
+      await saveConfig({ baseUrl: normalizeBaseUrl(value ?? config.baseUrl) }, { cwd: ctx.cwd, scope });
+    } else if (choice.startsWith("Bank strategy:")) {
+      const value = await ctx.ui.select("Bank strategy", ["manual", "per-repo", "per-directory", "git-branch", "pi-session", "global"]);
+      await saveConfig({ bankStrategy: normalizeBankStrategy(value) as BankStrategy }, { cwd: ctx.cwd, scope });
+    } else if (choice.startsWith("Bank ID:")) {
+      const value = await ctx.ui.input("Bank ID", config.bankId ?? "");
+      await saveConfig({ bankId: value || undefined, bankStrategy: value ? "manual" : "per-repo" }, { cwd: ctx.cwd, scope });
+    } else if (choice.startsWith("Recall mode:")) {
+      const value = await ctx.ui.select("Recall mode", ["hybrid", "context", "tools", "off"]);
+      await saveConfig({ recallMode: normalizeRecallMode(value) }, { cwd: ctx.cwd, scope });
+    } else if (choice.startsWith("Retain mode:")) {
+      const value = await ctx.ui.select("Retain mode", ["response", "step-batch", "both", "off"]);
+      await saveConfig({ retainMode: value as any }, { cwd: ctx.cwd, scope });
+    }
+
+    const updated = await resolveConfig(ctx.cwd);
+    setRecallMode(updated.recallMode);
+    await connect(ctx);
+    ctx.ui.notify(`Saved to ${scope}. Active config refreshed.`, "success");
+  }
+};
+
+const updateStatusBar = (ctx: ExtensionContext, state: "off" | "connected" | "syncing" | "offline"): void => {
+  const labels: Record<typeof state, string> = {
+    off: "🧠 Hindsight off",
+    connected: "🧠 Hindsight connected",
+    syncing: "🧠 Hindsight syncing",
+    offline: "🧠 Hindsight offline",
+  };
+  ctx.ui.setStatus("hindsight", labels[state]);
 };
 
 const connect = async (ctx: ExtensionContext): Promise<void> => {
   clearHandles();
   const config = await resolveConfig(ctx.cwd);
-  if (!config.enabled) throw new Error("Hindsight is disabled.");
-  const handles = await bootstrap(config, ctx.cwd);
-  await refreshCachedContext(handles);
+  if (!config.enabled) {
+    updateStatusBar(ctx, "off");
+    throw new Error("Hindsight is disabled.");
+  }
+  try {
+    const handles = await bootstrap(config, ctx.cwd);
+    await refreshCachedContext(handles);
+    updateStatusBar(ctx, "connected");
+  } catch (error) {
+    updateStatusBar(ctx, "offline");
+    throw error;
+  }
 };
 
 const statusText = async (ctx: ExtensionContext): Promise<string> => {
@@ -213,12 +511,16 @@ const statusText = async (ctx: ExtensionContext): Promise<string> => {
     `Strategy: ${config.bankStrategy}`,
     `Recall mode: ${config.recallMode}`,
     `Recall types: ${config.recallTypes.join(", ")}`,
+    `Recall per type: ${config.recallPerType}`,
+    `Recall display: ${config.recallDisplayMode}`,
     `Search budget: ${config.searchBudget}`,
     `Reflect budget: ${config.reflectBudget}`,
     `Reflect dynamic budget: ${config.dialecticDynamic ? "on" : "off"}`,
     `Reasoning level: ${config.reasoningLevel}`,
     `Reasoning cap: ${config.reasoningLevelCap ?? "(none)"}`,
     `Write frequency: ${config.writeFrequency}`,
+    `Retain mode: ${config.retainMode}`,
+    `Step retain threshold: ${config.stepRetainThreshold}`,
     `Auto-create bank: ${config.autoCreateBank ? "yes" : "no"}`,
     `Injection: ${config.injectionFrequency}`,
     `Context TTL: ${config.contextRefreshTtlSeconds}s`,
@@ -238,7 +540,10 @@ export const registerCommands = (pi: ExtensionAPI): void => {
   pi.registerCommand("hindsight:status", {
     description: "Show Hindsight connection and runtime status",
     handler: async (_args: string, ctx: ExtensionContext) => {
-      ctx.ui.notify(await statusText(ctx), "info");
+      const text = await statusText(ctx);
+      const config = await resolveConfig(ctx.cwd);
+      updateStatusBar(ctx, !config.enabled ? "off" : getHandles() ? "connected" : "offline");
+      ctx.ui.notify(text, "info");
     },
   });
 
@@ -249,20 +554,41 @@ export const registerCommands = (pi: ExtensionAPI): void => {
     },
   });
 
-  pi.registerCommand("hindsight:tui", {
-    description: "Interactive Hindsight config menu",
-    handler: async (_args: string, ctx: ExtensionContext) => {
-      await runConfigTui(ctx);
-    },
-  });
-
   pi.registerCommand("hindsight:config", {
     description: "Show effective Hindsight config with secrets redacted",
     handler: async (_args: string, ctx: ExtensionContext) => {
       const config = await resolveConfig(ctx.cwd);
       const handles = getHandles();
+      updateStatusBar(ctx, !config.enabled ? "off" : handles ? "connected" : "offline");
       const { renameSessionToBank: _renameSessionToBank, ...displayConfig } = config;
       ctx.ui.notify(JSON.stringify({ ...displayConfig, apiKey: mask(config.apiKey), connected: Boolean(handles), activeBank: handles?.bankId ?? null }, null, 2), "info");
+    },
+  });
+
+  pi.registerCommand("hindsight:where", {
+    description: "Show which Hindsight config files exist and what values they contribute",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      const sources = await inspectConfigSources(ctx.cwd);
+      const effective = await resolveConfig(ctx.cwd);
+      const lines: string[] = [];
+      lines.push(`Effective baseUrl: ${effective.baseUrl}`);
+      lines.push(`Effective bankId: ${effective.bankId ?? "(none)"}`);
+      lines.push(`Effective bankStrategy: ${effective.bankStrategy}`);
+      lines.push(`Effective globalBankId: ${effective.globalBankId ?? "(none)"}`);
+      lines.push("");
+      for (const source of sources) {
+        lines.push(`${source.exists ? "✓" : "-"} ${source.kind}: ${source.path}`);
+        if (source.data) {
+          const host = source.data.host?.pi;
+          if (source.data.baseUrl || source.data.api_url) lines.push(`  baseUrl: ${source.data.baseUrl ?? source.data.api_url}`);
+          if (source.data.bankId || source.data.bank_id) lines.push(`  bankId: ${source.data.bankId ?? source.data.bank_id}`);
+          if (source.data.globalBankId || source.data.global_bank) lines.push(`  globalBankId: ${source.data.globalBankId ?? source.data.global_bank}`);
+          if (source.data.bankStrategy) lines.push(`  bankStrategy: ${source.data.bankStrategy}`);
+          if (host?.recallMode) lines.push(`  host.pi.recallMode: ${host.recallMode}`);
+          if (host?.retainMode) lines.push(`  host.pi.retainMode: ${host.retainMode}`);
+        }
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 
@@ -270,6 +596,7 @@ export const registerCommands = (pi: ExtensionAPI): void => {
     description: "Connect or reconnect Hindsight now",
     handler: async (_args: string, ctx: ExtensionContext) => {
       await connect(ctx);
+      updateStatusBar(ctx, "connected");
       ctx.ui.notify("Hindsight connected and cache refreshed.", "success");
     },
   });
@@ -290,6 +617,7 @@ export const registerCommands = (pi: ExtensionAPI): void => {
       checks.push(`reflect_dynamic_budget: ${config.dialecticDynamic ? "on" : "off"}`);
 
       if (!config.enabled) {
+        updateStatusBar(ctx, "off");
         ctx.ui.notify(checks.join("\n"), "warning");
         return;
       }
@@ -309,10 +637,12 @@ export const registerCommands = (pi: ExtensionAPI): void => {
           checks.push(`entities: ${insights.entitiesCount ?? "unknown"}`);
         }
         if (handles.linked.length > 0) checks.push(`linked_resolved: ${handles.linked.map((h) => `${h.name}:${h.bankId}`).join(", ")}`);
+        updateStatusBar(ctx, "connected");
         ctx.ui.notify(checks.join("\n"), "success");
       } catch (error) {
         checks.push(`connectivity: failed`);
         checks.push(`error: ${error instanceof Error ? error.message : String(error)}`);
+        updateStatusBar(ctx, "offline");
         ctx.ui.notify(checks.join("\n"), "error");
       }
     },
@@ -359,6 +689,7 @@ export const registerCommands = (pi: ExtensionAPI): void => {
       }
       clearCachedContext();
       await refreshCachedContext(handles);
+      updateStatusBar(ctx, "connected");
       ctx.ui.notify("Hindsight cache refreshed.", "success");
     },
   });
@@ -374,52 +705,15 @@ export const registerCommands = (pi: ExtensionAPI): void => {
       const current = await resolveConfig(ctx.cwd);
       await saveConfig({
         mappings: { ...current.mappings, [ctx.cwd]: bankId },
-      });
+      }, { cwd: ctx.cwd, scope: "global" });
       ctx.ui.notify(`Mapped ${ctx.cwd} → ${bankId}`, "success");
     },
   });
 
-  pi.registerCommand("hindsight:recall", {
-    description: "Adjust recall/injection settings",
-    handler: async (_args: string, ctx: ExtensionContext) => {
-      await runRecallWizard(ctx);
-    },
-  });
-
-  pi.registerCommand("hindsight:retain", {
-    description: "Adjust retain/upload settings",
-    handler: async (_args: string, ctx: ExtensionContext) => {
-      await runRetainWizard(ctx);
-    },
-  });
-
   pi.registerCommand("hindsight:settings", {
-    description: "Show quick summary of recall/retain knobs",
+    description: "Interactive Hindsight settings",
     handler: async (_args: string, ctx: ExtensionContext) => {
-      const config = await resolveConfig(ctx.cwd);
-      ctx.ui.notify([
-        `Enabled: ${config.enabled ? "yes" : "no"}`,
-        `Global bank: ${config.globalBankId ?? "(none)"}`,
-        `Recall mode: ${config.recallMode}`,
-        `Recall types: ${config.recallTypes.join(", ")}`,
-        `Search budget: ${config.searchBudget}`,
-        `Reflect budget: ${config.reflectBudget}`,
-        `Reflect dynamic budget: ${config.dialecticDynamic ? "on" : "off"}`,
-        `Reasoning level: ${config.reasoningLevel}`,
-        `Reasoning cap: ${config.reasoningLevelCap ?? "(none)"}`,
-        `Context tokens: ${config.contextTokens}`,
-        `Context TTL: ${config.contextRefreshTtlSeconds}s`,
-        `Context cadence: ${config.contextCadence}`,
-        `Refresh threshold: ${config.contextRefreshMessageThreshold}`,
-        `Injection: ${config.injectionFrequency}`,
-        `Write frequency: ${config.writeFrequency}`,
-        `Auto-create bank: ${config.autoCreateBank ? "yes" : "no"}`,
-        `Save messages: ${config.saveMessages ? "yes" : "no"}`,
-        `Tool preview length: ${config.toolPreviewLength}`,
-        `Recall indicator: ${config.showRecallIndicator ? (config.indicatorsInContext ? "in-context" : "ui-only") : "off"}`,
-        `Retain indicator: ${config.showRetainIndicator ? (config.indicatorsInContext ? "in-context" : "ui-only") : "off"}`,
-        `Max message length: ${config.maxMessageLength}`,
-      ].join("\n"), "info");
+      await runConfigTui(ctx);
     },
   });
 };

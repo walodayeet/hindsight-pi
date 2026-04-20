@@ -9,6 +9,8 @@ export type InjectionFrequency = "every-turn" | "first-turn";
 export type SearchBudget = "low" | "mid" | "high";
 export type ReasoningLevel = "low" | "medium" | "high";
 export type RecallType = "world" | "experience" | "observation";
+export type RetainMode = "response" | "step-batch" | "both" | "off";
+export type RecallDisplayMode = "grouped" | "unified";
 
 export interface HostConfig {
   enabled?: boolean;
@@ -18,6 +20,8 @@ export interface HostConfig {
   linkedHosts?: string[];
   recallMode?: RecallMode;
   recallTypes?: RecallType[];
+  recallPerType?: number;
+  recallDisplayMode?: RecallDisplayMode;
   autoCreateBank?: boolean;
   contextTokens?: number;
   contextRefreshTtlSeconds?: number;
@@ -26,6 +30,8 @@ export interface HostConfig {
   injectionFrequency?: InjectionFrequency;
   writeFrequency?: WriteFrequency | number;
   saveMessages?: boolean;
+  retainMode?: RetainMode;
+  stepRetainThreshold?: number;
   searchBudget?: SearchBudget;
   reflectBudget?: SearchBudget;
   dialecticDynamic?: boolean;
@@ -95,6 +101,8 @@ export interface HindsightConfig {
   linkedHostConfigs: ResolvedLinkedHostConfig[];
   recallMode: RecallMode;
   recallTypes: RecallType[];
+  recallPerType: number;
+  recallDisplayMode: RecallDisplayMode;
   autoCreateBank: boolean;
   contextTokens: number;
   contextRefreshTtlSeconds: number;
@@ -103,6 +111,8 @@ export interface HindsightConfig {
   injectionFrequency: InjectionFrequency;
   writeFrequency: WriteFrequency | number;
   saveMessages: boolean;
+  retainMode: RetainMode;
+  stepRetainThreshold: number;
   searchBudget: SearchBudget;
   reflectBudget: SearchBudget;
   dialecticDynamic: boolean;
@@ -121,6 +131,13 @@ export interface HindsightConfig {
 export const CONFIG_PATH = join(homedir(), ".hindsight", "config.json");
 export const LOCAL_CONFIG_PATH = ".hindsight/config.json";
 const DEFAULT_BASE_URL = "http://localhost:8888";
+
+export const normalizeBaseUrl = (value: string | undefined | null): string => {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed) return DEFAULT_BASE_URL;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed.replace(/\/$/, "");
+  return `http://${trimmed.replace(/\/$/, "")}`;
+};
 
 const intOr = (value: unknown, fallback: number): number => {
   if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
@@ -184,6 +201,19 @@ export const normalizeRecallMode = (value: unknown): RecallMode => {
 };
 
 const normalizeInjectionFrequency = (value: unknown): InjectionFrequency => value === "every-turn" ? "every-turn" : "first-turn";
+const normalizeRecallDisplayMode = (value: unknown): RecallDisplayMode => value === "unified" ? "unified" : "grouped";
+
+const normalizeRetainMode = (value: unknown): RetainMode => {
+  switch (value) {
+    case "response":
+    case "step-batch":
+    case "both":
+    case "off":
+      return value;
+    default:
+      return "response";
+  }
+};
 
 const normalizeBudget = (value: unknown, fallback: SearchBudget): SearchBudget => {
   switch (value) {
@@ -214,7 +244,7 @@ const normalizeWriteFrequency = (value: unknown): WriteFrequency | number => {
     const parsed = Number(value);
     if (Number.isInteger(parsed) && parsed > 0) return parsed;
   }
-  return 5;
+  return "turn";
 };
 
 let activeRecallMode: RecallMode = "hybrid";
@@ -289,6 +319,37 @@ const collectParentDirs = (cwd: string): string[] => {
   return dirs.reverse();
 };
 
+export interface ConfigSourceSnapshot {
+  path: string;
+  kind: "global-toml" | "global-json" | "project-toml" | "project-json";
+  exists: boolean;
+  data: HindsightConfigFile | null;
+}
+
+export const inspectConfigSources = async (cwd?: string): Promise<ConfigSourceSnapshot[]> => {
+  const sources: ConfigSourceSnapshot[] = [];
+  const globalTomlPath = join(homedir(), ".hindsight", "config.toml");
+  const globalToml = await parseTomlFile(globalTomlPath);
+  sources.push({ path: globalTomlPath, kind: "global-toml", exists: globalToml !== null, data: globalToml });
+
+  const globalJson = await readJsonIfPresent(CONFIG_PATH);
+  sources.push({ path: CONFIG_PATH, kind: "global-json", exists: globalJson !== null, data: globalJson });
+
+  if (cwd) {
+    for (const dir of collectParentDirs(cwd)) {
+      const projectTomlPath = join(dir, ".hindsight", "config.toml");
+      const projectToml = await parseTomlFile(projectTomlPath);
+      sources.push({ path: projectTomlPath, kind: "project-toml", exists: projectToml !== null, data: projectToml });
+
+      const projectJsonPath = join(dir, LOCAL_CONFIG_PATH);
+      const projectJson = await readJsonIfPresent(projectJsonPath);
+      sources.push({ path: projectJsonPath, kind: "project-json", exists: projectJson !== null, data: projectJson });
+    }
+  }
+
+  return sources;
+};
+
 export const readConfigFile = async (cwd?: string): Promise<HindsightConfigFile | null> => {
   let merged = mergeConfigFiles(await parseTomlFile(join(homedir(), ".hindsight", "config.toml")), await readJsonIfPresent(CONFIG_PATH));
 
@@ -311,7 +372,7 @@ export const resolveConfig = async (cwd?: string): Promise<HindsightConfig> => {
     if (!entry) return [];
     const resolved: ResolvedLinkedHostConfig = {
       name,
-      baseUrl: entry.baseUrl ?? file?.baseUrl ?? file?.api_url ?? DEFAULT_BASE_URL,
+      baseUrl: normalizeBaseUrl(entry.baseUrl ?? file?.baseUrl ?? file?.api_url ?? DEFAULT_BASE_URL),
       apiKey: entry.apiKey ?? file?.apiKey ?? file?.api_key,
       bankId: entry.bankId,
       globalBankId: file?.globalBankId ?? file?.global_bank,
@@ -326,17 +387,19 @@ export const resolveConfig = async (cwd?: string): Promise<HindsightConfig> => {
   const config: HindsightConfig = {
     enabled: boolOr(process.env.HINDSIGHT_ENABLED ?? host.enabled, Boolean(process.env.HINDSIGHT_API_KEY || file?.apiKey || file?.api_key || process.env.HINDSIGHT_BASE_URL || file?.baseUrl || file?.api_url)),
     apiKey: process.env.HINDSIGHT_API_KEY ?? file?.apiKey ?? file?.api_key,
-    baseUrl: process.env.HINDSIGHT_BASE_URL ?? file?.baseUrl ?? file?.api_url ?? DEFAULT_BASE_URL,
+    baseUrl: normalizeBaseUrl(process.env.HINDSIGHT_BASE_URL ?? file?.baseUrl ?? file?.api_url ?? DEFAULT_BASE_URL),
     bankId: process.env.HINDSIGHT_BANK_ID ?? file?.bankId ?? file?.bank_id,
     globalBankId: process.env.HINDSIGHT_GLOBAL_BANK_ID ?? file?.globalBankId ?? file?.global_bank,
-    bankStrategy: normalizeBankStrategy(process.env.HINDSIGHT_BANK_STRATEGY ?? file?.bankStrategy),
+    bankStrategy: normalizeBankStrategy(process.env.HINDSIGHT_BANK_STRATEGY ?? file?.bankStrategy ?? ((process.env.HINDSIGHT_BANK_ID ?? file?.bankId ?? file?.bank_id) ? "manual" : "per-repo")),
     workspace: host.workspace ?? "pi",
     peerName: host.peerName ?? "user",
     aiPeer: host.aiPeer ?? "pi",
     linkedHosts,
     linkedHostConfigs,
     recallMode: normalizeRecallMode(process.env.HINDSIGHT_RECALL_MODE ?? host.recallMode),
-    recallTypes: normalizeRecallTypes(process.env.HINDSIGHT_RECALL_TYPES ?? host.recallTypes ?? file?.recallTypes ?? file?.recall_types),
+    recallTypes: normalizeRecallTypes(process.env.HINDSIGHT_RECALL_TYPES ?? host.recallTypes ?? file?.recallTypes ?? file?.recall_types ?? ["observation", "experience"]),
+    recallPerType: intOr(process.env.HINDSIGHT_RECALL_PER_TYPE ?? host.recallPerType, 2),
+    recallDisplayMode: normalizeRecallDisplayMode(process.env.HINDSIGHT_RECALL_DISPLAY_MODE ?? host.recallDisplayMode),
     autoCreateBank: boolOr(process.env.HINDSIGHT_AUTO_CREATE_BANK ?? host.autoCreateBank, true),
     contextTokens: intOr(process.env.HINDSIGHT_CONTEXT_TOKENS ?? host.contextTokens, 1200),
     contextRefreshTtlSeconds: intOr(process.env.HINDSIGHT_CONTEXT_REFRESH_TTL_SECONDS ?? host.contextRefreshTtlSeconds, 300),
@@ -345,6 +408,8 @@ export const resolveConfig = async (cwd?: string): Promise<HindsightConfig> => {
     injectionFrequency: normalizeInjectionFrequency(process.env.HINDSIGHT_INJECTION_FREQUENCY ?? host.injectionFrequency ?? "first-turn"),
     writeFrequency: normalizeWriteFrequency(process.env.HINDSIGHT_WRITE_FREQUENCY ?? host.writeFrequency),
     saveMessages: boolOr(process.env.HINDSIGHT_SAVE_MESSAGES ?? host.saveMessages, true),
+    retainMode: normalizeRetainMode(process.env.HINDSIGHT_RETAIN_MODE ?? host.retainMode),
+    stepRetainThreshold: intOr(process.env.HINDSIGHT_STEP_RETAIN_THRESHOLD ?? host.stepRetainThreshold, 5),
     searchBudget: normalizeBudget(process.env.HINDSIGHT_SEARCH_BUDGET ?? host.searchBudget, "mid"),
     reflectBudget: normalizeBudget(process.env.HINDSIGHT_REFLECT_BUDGET ?? host.reflectBudget, "low"),
     dialecticDynamic: boolOr(process.env.HINDSIGHT_DIALECTIC_DYNAMIC ?? host.dialecticDynamic, true),
@@ -373,6 +438,8 @@ export const saveConfig = async (input: {
   bankStrategy?: BankStrategy;
   recallMode?: RecallMode;
   recallTypes?: RecallType[];
+  recallPerType?: number;
+  recallDisplayMode?: RecallDisplayMode;
   autoCreateBank?: boolean;
   logging?: boolean;
   peerName?: string;
@@ -391,6 +458,8 @@ export const saveConfig = async (input: {
   injectionFrequency?: InjectionFrequency;
   writeFrequency?: WriteFrequency | number;
   saveMessages?: boolean;
+  retainMode?: RetainMode;
+  stepRetainThreshold?: number;
   toolPreviewLength?: number;
   maxMessageLength?: number;
   showRecallIndicator?: boolean;
@@ -398,21 +467,36 @@ export const saveConfig = async (input: {
   indicatorsInContext?: boolean;
   renameSessionToBank?: boolean;
   mappings?: Record<string, string>;
-}): Promise<void> => {
-  const current = (await readConfigFile()) ?? {};
+}, options?: { cwd?: string; scope?: "global" | "project" }): Promise<void> => {
+  const scope = options?.scope ?? "global";
+  const targetPath = scope === "project" && options?.cwd ? join(options.cwd, LOCAL_CONFIG_PATH) : CONFIG_PATH;
+  const current = (await readJsonIfPresent(targetPath)) ?? {};
   const next: HindsightConfigFile = {
     ...current,
-    apiKey: input.apiKey ?? current.apiKey ?? current.api_key,
-    api_key: input.apiKey ?? current.apiKey ?? current.api_key,
-    baseUrl: input.baseUrl ?? current.baseUrl ?? current.api_url,
-    api_url: input.baseUrl ?? current.baseUrl ?? current.api_url,
-    bankId: input.bankId ?? current.bankId ?? current.bank_id,
-    bank_id: input.bankId ?? current.bankId ?? current.bank_id,
-    globalBankId: input.globalBankId ?? current.globalBankId ?? current.global_bank,
-    global_bank: input.globalBankId ?? current.globalBankId ?? current.global_bank,
-    bankStrategy: input.bankStrategy ?? current.bankStrategy,
-    recallTypes: input.recallTypes ?? current.recallTypes ?? normalizeRecallTypes(current.recall_types),
-    recall_types: input.recallTypes ?? current.recallTypes ?? normalizeRecallTypes(current.recall_types),
+    ...(input.apiKey !== undefined || current.apiKey !== undefined || current.api_key !== undefined
+      ? { apiKey: input.apiKey ?? current.apiKey ?? current.api_key, api_key: input.apiKey ?? current.apiKey ?? current.api_key }
+      : {}),
+    ...(input.baseUrl !== undefined || current.baseUrl !== undefined || current.api_url !== undefined
+      ? {
+          baseUrl: normalizeBaseUrl(input.baseUrl ?? current.baseUrl ?? current.api_url),
+          api_url: normalizeBaseUrl(input.baseUrl ?? current.baseUrl ?? current.api_url),
+        }
+      : {}),
+    ...(input.bankId !== undefined || current.bankId !== undefined || current.bank_id !== undefined
+      ? { bankId: input.bankId ?? current.bankId ?? current.bank_id, bank_id: input.bankId ?? current.bankId ?? current.bank_id }
+      : {}),
+    ...(input.globalBankId !== undefined || current.globalBankId !== undefined || current.global_bank !== undefined
+      ? { globalBankId: input.globalBankId ?? current.globalBankId ?? current.global_bank, global_bank: input.globalBankId ?? current.globalBankId ?? current.global_bank }
+      : {}),
+    ...(input.bankStrategy !== undefined || current.bankStrategy !== undefined
+      ? { bankStrategy: input.bankStrategy ?? current.bankStrategy }
+      : {}),
+    ...(input.recallTypes !== undefined || current.recallTypes !== undefined || current.recall_types !== undefined
+      ? {
+          recallTypes: input.recallTypes ?? current.recallTypes ?? normalizeRecallTypes(current.recall_types),
+          recall_types: input.recallTypes ?? current.recallTypes ?? normalizeRecallTypes(current.recall_types),
+        }
+      : {}),
     mappings: input.mappings ?? current.mappings,
     host: {
       ...(current.host ?? {}),
@@ -425,6 +509,8 @@ export const saveConfig = async (input: {
         linkedHosts: input.linkedHosts ?? current.host?.pi?.linkedHosts,
         recallMode: input.recallMode ?? current.host?.pi?.recallMode,
         recallTypes: input.recallTypes ?? current.host?.pi?.recallTypes,
+        recallPerType: input.recallPerType ?? current.host?.pi?.recallPerType,
+        recallDisplayMode: input.recallDisplayMode ?? current.host?.pi?.recallDisplayMode,
         autoCreateBank: input.autoCreateBank ?? current.host?.pi?.autoCreateBank,
         logging: input.logging ?? current.host?.pi?.logging,
         dialecticDynamic: input.dialecticDynamic ?? current.host?.pi?.dialecticDynamic,
@@ -443,12 +529,14 @@ export const saveConfig = async (input: {
         injectionFrequency: input.injectionFrequency ?? current.host?.pi?.injectionFrequency,
         writeFrequency: input.writeFrequency ?? current.host?.pi?.writeFrequency,
         saveMessages: input.saveMessages ?? current.host?.pi?.saveMessages,
+        retainMode: input.retainMode ?? current.host?.pi?.retainMode,
+        stepRetainThreshold: input.stepRetainThreshold ?? current.host?.pi?.stepRetainThreshold,
         toolPreviewLength: input.toolPreviewLength ?? current.host?.pi?.toolPreviewLength,
         maxMessageLength: input.maxMessageLength ?? current.host?.pi?.maxMessageLength,
       },
     },
   };
 
-  await mkdir(dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
-  await writeFile(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await mkdir(dirname(targetPath), { recursive: true, mode: 0o700 });
+  await writeFile(targetPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 };

@@ -45,11 +45,17 @@ const branchName = async (cwd: string): Promise<string | null> => {
 
 const sessionSlug = (): string => sanitizeBankId(`session-${Date.now().toString(36)}`);
 
+export const deriveWorkspaceSessionName = (cwd: string): string => {
+  const normalized = cwd.replace(/[:\\/]+/g, "_").replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+  const short = normalized.length > 48 ? normalized.slice(-48) : normalized;
+  return `dir_${short}_${hash(cwd).slice(0, 8)}`;
+};
+
 export const deriveBankId = async (cwd: string, strategy: BankStrategy, config: HindsightConfig): Promise<string> => {
   const mapped = config.mappings[cwd];
   if (mapped) return sanitizeBankId(mapped);
 
-  if (strategy === "manual" && config.bankId) return sanitizeBankId(config.bankId);
+  if (config.bankId) return sanitizeBankId(config.bankId);
   if (strategy === "global") return sanitizeBankId(config.globalBankId ?? "pi-global-memory");
   if (strategy === "pi-session") return sessionSlug();
   if (strategy === "per-directory") return directoryKey(cwd);

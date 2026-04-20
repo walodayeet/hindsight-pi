@@ -30,8 +30,16 @@ const truncateToBudget = (text: string, tokens: number): string => {
   return text.length > budgetChars ? `${text.slice(0, budgetChars)}…` : text;
 };
 
-const renderResults = (results: Array<{ text?: string; type?: string }>, contextTokens: number): string | null => {
+const renderResults = (results: Array<{ text?: string; type?: string }>, contextTokens: number, displayMode: "grouped" | "unified"): string | null => {
   if (results.length === 0) return null;
+  if (displayMode === "unified") {
+    const lines = results
+      .map((result) => result.text?.trim())
+      .filter((value): value is string => Boolean(value))
+      .map((text) => `- ${text}`);
+    if (lines.length === 0) return null;
+    return truncateToBudget(`[Persistent memory]\n${lines.join("\n")}`, contextTokens);
+  }
   const grouped = new Map<string, string[]>();
   for (const result of results) {
     const type = result.type ?? "memory";
@@ -48,14 +56,16 @@ const renderResults = (results: Array<{ text?: string; type?: string }>, context
 
 export const refreshCachedContext = async (handles: HindsightHandles): Promise<void> => {
   const query = "What user preferences, durable project facts, architecture facts, and recent coding context matter for this pi workspace?";
-  const settled = await Promise.allSettled(uniqueBankIds(handles).map(async (bankId) => {
-    const result = await handles.client.recall(bankId, query, {
-      budget: handles.config.searchBudget,
-      maxTokens: Math.max(handles.config.contextTokens * 2, 512),
-      types: handles.config.recallTypes,
-    });
-    return result?.results ?? [];
-  }));
+  const settled = await Promise.allSettled(uniqueBankIds(handles).flatMap((bankId) =>
+    handles.config.recallTypes.map(async (type) => {
+      const result = await handles.client.recall(bankId, query, {
+        budget: handles.config.searchBudget,
+        maxTokens: Math.max(handles.config.contextTokens * 2, 512),
+        types: [type],
+      });
+      return (result?.results ?? []).slice(0, handles.config.recallPerType).map((entry: any) => ({ ...entry, type }));
+    }),
+  ));
 
   const results = settled
     .filter((entry): entry is PromiseFulfilledResult<Array<{ text?: string; type?: string }>> => entry.status === "fulfilled")
@@ -63,7 +73,7 @@ export const refreshCachedContext = async (handles: HindsightHandles): Promise<v
     .flat();
 
   cachedContext = {
-    text: renderResults(results, handles.config.contextTokens),
+    text: renderResults(results, handles.config.contextTokens, handles.config.recallDisplayMode),
     refreshedAt: Date.now(),
     pinned: false,
   };
