@@ -85,7 +85,7 @@ describe("config file resolution", () => {
     const globalDir = dirname(CONFIG_PATH);
     await mkdir(globalDir, { recursive: true });
     await writeFile(join(globalDir, "config.json"), JSON.stringify({
-      baseUrl: "http://192.168.9.24:8888",
+      baseUrl: "http://localhost:8888",
       bankId: "global-bank",
       host: { pi: { enabled: true, recallMode: "hybrid" } },
     }));
@@ -94,7 +94,7 @@ describe("config file resolution", () => {
 
     const globalSaved = JSON.parse(await readFile(join(globalDir, "config.json"), "utf8"));
     const projectSaved = JSON.parse(await readFile(join(cwd, ".hindsight", "config.json"), "utf8"));
-    expect(globalSaved.baseUrl).toBe("http://192.168.9.24:8888");
+    expect(globalSaved.baseUrl).toBe("http://localhost:8888");
     expect(projectSaved.baseUrl).toBeUndefined();
     expect(projectSaved.api_url).toBeUndefined();
     expect(projectSaved.host?.pi?.showRecallIndicator).toBe(false);
@@ -107,7 +107,7 @@ describe("config file resolution", () => {
     const localDir = join(cwd, ".hindsight");
     await mkdir(localDir, { recursive: true });
     await writeFile(join(localDir, "config.json"), JSON.stringify({
-      baseUrl: "http://192.168.9.24:8888",
+      baseUrl: "http://localhost:8888",
       bankId: "manual-bank",
       host: { pi: { enabled: true } },
     }));

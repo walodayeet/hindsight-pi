@@ -24,7 +24,7 @@ const client = new HindsightClient({
 ```
 
 Also documented:
-- local/self-hosted API commonly runs at `http://localhost:8888`
+- local/self-hosted API commonly runs at `http://<your-hindsight-host>:8888`
 - cloud uses API key auth
 - Node/TypeScript package: `@vectorize-io/hindsight-client`
 
@@ -267,7 +267,7 @@ Extension decision:
 
 Verified:
 - Cloud API works with `baseUrl` + `apiKey`
-- Self-host/local can run with Docker at `http://localhost:8888`
+- Self-host/local can run with Docker at `http://<your-hindsight-host>:8888`
 - Hindsight UI commonly at `http://localhost:9999`
 - local deployment requires upstream LLM provider keys for Hindsight backend itself
 

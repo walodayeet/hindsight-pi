@@ -68,7 +68,7 @@ pi -e ./extensions/index.ts
 Example tested server:
 
 ```text
-http://192.168.9.24:8888
+http://<your-hindsight-host>:8888
 ```
 
 ### 2. Load extension in pi
@@ -164,7 +164,7 @@ Precedence:
 
 ```json
 {
-  "baseUrl": "http://192.168.9.24:8888",
+  "baseUrl": "http://<your-hindsight-host>:8888",
   "bankId": "optional-manual-bank",
   "bankStrategy": "manual",
   "host": {
@@ -271,7 +271,7 @@ Use when you want strong defaults with minimal tuning.
 
 ```json
 {
-  "baseUrl": "http://192.168.9.24:8888",
+  "baseUrl": "http://<your-hindsight-host>:8888",
   "host": {
     "pi": {
       "enabled": true,
@@ -372,7 +372,7 @@ Run:
 /hindsight:where
 ```
 
-Look for project config writing `http://localhost:8888`.
+Look for project config writing an unexpected host such as `http://localhost:8888`.
 
 ## Session naming
 
@@ -391,7 +391,7 @@ npm run smoke
 Smoke test against real server:
 
 ```bash
-HINDSIGHT_BASE_URL=http://192.168.9.24:8888 npm run smoke
+HINDSIGHT_BASE_URL=http://<your-hindsight-host>:8888 npm run smoke
 ```
 
 ## Release positioning
@@ -429,7 +429,7 @@ Passed during development:
 ```bash
 npm run typecheck
 npm test
-HINDSIGHT_BASE_URL=http://192.168.9.24:8888 npm run smoke
+HINDSIGHT_BASE_URL=http://<your-hindsight-host>:8888 npm run smoke
 ```
 
 ## Project layout

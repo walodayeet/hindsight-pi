@@ -1,6 +1,6 @@
 import { HindsightClient } from '@vectorize-io/hindsight-client';
 
-const baseUrl = process.env.HINDSIGHT_BASE_URL || 'http://192.168.9.24:8888';
+const baseUrl = process.env.HINDSIGHT_BASE_URL || 'http://localhost:8888';
 const apiKey = process.env.HINDSIGHT_API_KEY;
 const bankId = process.env.HINDSIGHT_TEST_BANK_ID || 'hindsight-pi-smoke';
 
