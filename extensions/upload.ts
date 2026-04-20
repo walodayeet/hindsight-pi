@@ -324,12 +324,8 @@ export class WriteScheduler {
     }
 
     if (typeof this.frequency === "number") {
-      this.queuePending(writes, handles, queuedSummary);
-      if (this.pendingTurns >= this.frequency) {
-        await this.flushPending();
-        return { skipped: false, summary: savedSummary };
-      }
-      return { skipped: false, summary: queuedSummary };
+      for (const write of writes) await this.sendWithRetry(handles, write.bankId, write.items);
+      return { skipped: false, summary: savedSummary };
     }
 
     for (const write of writes) await this.sendWithRetry(handles, write.bankId, write.items);

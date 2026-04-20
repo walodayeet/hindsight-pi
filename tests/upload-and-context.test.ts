@@ -66,15 +66,13 @@ describe("upload helpers", () => {
     expect(calls.length).toBeGreaterThan(0);
   });
 
-  it("flushes numeric write batches after threshold", async () => {
-    const { handles, calls } = makeHandles({ retainMode: "response", writeFrequency: 2 });
-    const scheduler = new WriteScheduler(2);
+  it("does not delay response retain when numeric write frequency is set", async () => {
+    const { handles, calls } = makeHandles({ retainMode: "response", writeFrequency: 5 });
+    const scheduler = new WriteScheduler(5);
 
-    const first = await scheduler.onTurnEnd(handles, messages);
-    const second = await scheduler.onTurnEnd(handles, messages);
+    const outcome = await scheduler.onTurnEnd(handles, messages);
 
-    expect(first && !first.skipped && first.summary.mode).toBe("queued");
-    expect(second && !second.skipped && second.summary.mode).toBe("saved");
+    expect(outcome && !outcome.skipped && outcome.summary.mode).toBe("saved");
     expect(calls.length).toBeGreaterThan(0);
   });
 
