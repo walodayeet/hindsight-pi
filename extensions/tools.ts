@@ -3,6 +3,8 @@ import { Type } from "@sinclair/typebox";
 import { ensureBank, getBankInsights, getHandles, type HindsightHandles } from "./client.js";
 import { getRecallMode, type ReasoningLevel, type SearchBudget } from "./config.js";
 
+const sanitizeTag = (value: string): string => value.toLowerCase().replace(/[^a-z0-9:_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+
 const LEVELS: readonly ReasoningLevel[] = ["low", "medium", "high"];
 const LEVEL_TO_BUDGET: Record<ReasoningLevel, SearchBudget> = {
   low: "low",
@@ -113,10 +115,12 @@ export const registerTools = (pi: ExtensionAPI): void => {
         handles.config.reasoningLevelCap,
       );
 
+      const reflectQuery = params.context
+        ? `${params.query}\n\nAdditional context:\n${params.context}`
+        : params.query;
       const sections: string[] = [];
       for (const bankId of activeBankIds(handles)) {
-        const primary = await handles.client.reflect(bankId, params.query, {
-          context: params.context,
+        const primary = await handles.client.reflect(bankId, reflectQuery, {
           budget,
         });
         const label = bankId === handles.bankId ? handles.config.workspace : `${handles.config.workspace}:global`;
@@ -125,8 +129,7 @@ export const registerTools = (pi: ExtensionAPI): void => {
 
       for (const linked of handles.linked) {
         try {
-          const hostResult = await linked.client.reflect(linked.bankId, params.query, {
-            context: params.context,
+          const hostResult = await linked.client.reflect(linked.bankId, reflectQuery, {
             budget,
           });
           sections.push(`=== [${linked.name}] ===\n${hostResult?.text ?? "No synthesized context returned."}`);
@@ -159,10 +162,19 @@ export const registerTools = (pi: ExtensionAPI): void => {
         metadata: {
           source: "pi",
           explicit: "true",
+          kind: "explicit",
+          origin: "explicit",
           workspace: handles.config.workspace,
           peer: handles.config.peerName,
           aiPeer: handles.config.aiPeer,
         },
+        tags: [
+          "source:pi",
+          `workspace:${sanitizeTag(handles.config.workspace)}`,
+          `bank:${sanitizeTag(handles.bankId)}`,
+          "kind:explicit",
+          "origin:explicit",
+        ],
       });
       return {
         content: [{ type: "text", text: `Saved durable memory to ${handles.bankId}.` }],
@@ -198,7 +210,7 @@ export const registerTools = (pi: ExtensionAPI): void => {
         `Linked hosts: ${linked}`,
         `Base URL: ${handles.config.baseUrl}`,
         `Recall mode: ${handles.config.recallMode}`,
-        `Recall types: ${handles.config.recallTypes.join(", ")}`,
+        `Memory query mode: fresh recall across all memory types for auto-context`,
       ].join("\n");
       return {
         content: [{ type: "text", text }],

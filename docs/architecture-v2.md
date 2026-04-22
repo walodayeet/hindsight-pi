@@ -16,9 +16,11 @@ Architecture v2 should make `hindsight-pi`:
 ## Core principles
 
 1. **Fresh recall, not session cache**
-   - Recall should be based on current user turn.
+   - Recall should be based on the current user turn.
+   - No cached recall context. Recall is fast and should be queried fresh each turn based on the current user prompt.
+   - Caching recall results as a primary runtime strategy is an anti-pattern: it serves stale or irrelevant results when the user's query changes between turns, defeats the purpose of query-dependent recall, and adds unnecessary complexity such as TTL management, background refresh, and pinning.
    - Long-lived cached recall blobs are removed as primary architecture.
-   - Optional micro-cache allowed only for identical request tuples.
+   - Optional micro-cache is acceptable only for identical request tuples as a narrow optimization, never as a session-context layer.
 
 2. **Session document as primary durable unit**
    - One stable document per pi session.
@@ -94,10 +96,12 @@ Required outputs:
 ### 3. Recall layer
 Responsibilities:
 - derive recall query from current turn
-- fetch recall fresh from Hindsight
-- render ephemeral memory block
-- optionally use tiny identical-request micro-cache
+- fetch recall fresh from Hindsight with `client.recall(...)`
+- ephemerally inject recalled facts for the current turn
+- keep last recall result set extension-side for deterministic inspection UX
+- optionally use tiny identical-request micro-cache only as a narrow optimization
 - never depend on session-level cached recall blob
+- never require the LLM to narrate hidden prompt contents for transparency
 
 Current files:
 - `extensions/context.ts`
@@ -253,7 +257,9 @@ interface QueueItem {
 
 ## Current problem
 
-Current recall path uses session-level cached context with TTL/cadence/message-threshold behavior. This is hard to defend because recall should primarily depend on current user message.
+Current recall path uses session-level cached context with TTL/cadence/message-threshold behavior. This is hard to defend because recall should primarily depend on the current user message.
+
+No cached recall context. Recall is fast and should be queried fresh each turn based on the current user prompt. Caching recall results (as done by hindsight-pi) is an anti-pattern: it serves stale or irrelevant results when the user's query changes between turns, defeats the purpose of query-dependent recall, and adds unnecessary complexity (TTL management, background refresh, pinning). Each turn should recall based on the actual current user message.
 
 ## Future design
 
@@ -261,21 +267,23 @@ Current recall path uses session-level cached context with TTL/cadence/message-t
 On every `before_agent_start`:
 1. inspect latest user message
 2. derive recall query from current turn
-3. fetch recall fresh from Hindsight
-4. render memory block if enabled
-5. show UI-only compact notice
+3. call fresh `client.recall(...)` against the active bank
+4. ephemerally inject the resulting memory block if auto-context is enabled
+5. store the exact last recall result set extension-side for inspection commands/UI
+6. show a compact UI-only notice
 
 ### Optional micro-cache
-Allowed only if all of these match:
+If a micro-cache exists at all, it is allowed only when all request inputs are identical and the cache is extremely short-lived.
+
+Allowed key parts:
 - bank ID
 - normalized query
-- recall types
-- per-type count
-- display mode
+- token budget
+- recall mode
 
 TTL should be very short, e.g. 10-30s.
 
-This cache is performance optimization only, not session memory cache.
+This cache is a narrow performance optimization only, not session memory cache.
 
 ### Query derivation
 Preferred input:
@@ -296,10 +304,8 @@ Recommended official/default posture:
 - `recallMode = "tools"`
 - no automatic prompt injection by default
 - compact UI-only recall visibility remains allowed
-- grouped recall rendering still supported for non-default/hybrid mode
-- `recallTypes = ["observation", "experience"]`
-- `recallPerType = 2`
-- `injectionFrequency = "first-turn"` when hybrid mode is enabled
+- `injectionFrequency = "first-turn"` when auto-injection is enabled
+- recall-type and per-type tuning are removed or hidden from default UX for the auto-context path
 
 ### Memory block constraints
 Injected memory block should:
@@ -307,12 +313,27 @@ Injected memory block should:
 - not appear as transcript message
 - be stripped before retention
 - remain compact and typed
+- not rely on LLM self-audit or narration for transparency
+
+### Inspection path
+Transparency for recalled memory should be owned by the extension, not by the model.
+
+Required behavior:
+- keep default recall notice compact
+- store the last recall result set extension-side
+- provide deterministic inspection such as `/hindsight:inspect-last-recall`
+- show exactly what was loaded without requiring `hindsight_context`, `hindsight_search`, or model narration
 
 ## Retain architecture
 
 ## Current problem
 
 Current retain path uses summarized turn plaintext/chunk writes as primary representation. This is practical but controversial as canonical durable format.
+
+Important Hindsight behavior to respect:
+- `retain` completes before consolidation-derived observations finish updating
+- consolidation is background work and must not gate every-turn memory injection
+- every-turn recall should operate on fresh recall behavior, not wait for reflect or consolidation work
 
 ## Future design
 
@@ -406,6 +427,9 @@ Potentially deprecate:
 - `contextRefreshTtlSeconds`
 - `contextRefreshMessageThreshold`
 - `contextCadence`
+- default-user-facing `recallTypes`
+- default-user-facing `recallPerType`
+- default-user-facing `recallDisplayMode`
 
 ## Core config shape
 
@@ -418,9 +442,6 @@ Potentially deprecate:
   "host": {
     "pi": {
       "recallMode": "hybrid",
-      "recallTypes": ["observation", "experience"],
-      "recallPerType": 2,
-      "recallDisplayMode": "grouped",
       "injectionFrequency": "first-turn",
       "retainMode": "response",
       "stepRetainThreshold": 5,

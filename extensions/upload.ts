@@ -74,6 +74,7 @@ interface RetainItem {
   content: string;
   context?: string;
   metadata?: Record<string, unknown>;
+  tags?: string[];
   timestamp?: Date;
 }
 
@@ -111,6 +112,19 @@ export interface DeliveredRetainNotice {
 }
 
 const isConversationMessage = (message: any): boolean => message?.role === "user" || message?.role === "assistant";
+const META_MEMORY_QUERY_RE = /\b(what memory|what do you remember|what was recalled|what got recalled|what was loaded|what got loaded|memory do you have|what do you have in your context|what is in your context|don't use any tools|do not use any tools|hindsight_context)\b/i;
+const META_MEMORY_CONTENT_RE = /\b(what memory do you have|what was recalled|what got recalled|what was loaded|what got loaded|don't use any tools|do not use any tools|hindsight_context|hidden recalled payload|visible recall state|raw hidden recalled payload|memory context loaded)\b/i;
+const sanitizeTag = (value: string): string => value.toLowerCase().replace(/[^a-z0-9:_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+const buildRetainTags = (handles: HindsightHandles, bankId: string, kind: "turn-summary" | "explicit", origin: "auto" | "explicit"): string[] => {
+  const tags = [
+    "source:pi",
+    `workspace:${sanitizeTag(handles.config.workspace)}`,
+    `bank:${sanitizeTag(bankId)}`,
+    `kind:${kind}`,
+    `origin:${origin}`,
+  ];
+  return [...new Set(tags.filter((tag) => tag.length > 0))];
+};
 
 const latestUserText = (messages: any[]): string => {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -127,6 +141,7 @@ export const shouldSkipRetain = (messages: any[]): { skip: boolean; reason?: str
   if (prompt.length < 5) return { skip: true, reason: "too short" };
   if (TRIVIAL_PROMPT_RE.test(prompt)) return { skip: true, reason: "trivial" };
   if (/^(#nomem|#skip)(?=\s|$)/i.test(prompt)) return { skip: true, reason: "opt-out" };
+  if (META_MEMORY_QUERY_RE.test(prompt)) return { skip: true, reason: "meta-memory" };
   return { skip: false };
 };
 
@@ -140,6 +155,7 @@ const buildTurnSummary = (messages: any[]): string => {
     for (const pattern of STRIP_PATTERNS) text = text.replace(pattern, "");
     text = text.trim();
     if (!text) continue;
+    if (META_MEMORY_CONTENT_RE.test(text)) continue;
     if (message.role === "user") userParts.push(text);
     else assistantParts.push(text);
   }
@@ -154,16 +170,19 @@ const toRetainItems = (handles: HindsightHandles, messages: any[], bankId = hand
   const summary = buildTurnSummary(messages);
   if (!summary) return { summary: "", items: [] };
   const chunks = chunkTextSmart(summary, handles.config.maxMessageLength);
+  const tags = buildRetainTags(handles, bankId, "turn-summary", "auto");
   return {
     summary,
     items: chunks.map((chunk) => ({
-    content: chunk,
-    metadata: {
-      source: "pi",
-      kind: "turn-summary",
-      bankId,
-      workspace: handles.config.workspace,
-    },
+      content: chunk,
+      metadata: {
+        source: "pi",
+        kind: "turn-summary",
+        origin: "auto",
+        bankId,
+        workspace: handles.config.workspace,
+      },
+      tags,
       timestamp: new Date(),
     })),
   };

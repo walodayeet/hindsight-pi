@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { bootstrap, clearHandles, ensureBank, getBankInsights, getHandles } from "./client.js";
-import { clearCachedContext, refreshCachedContext, renderCachedContext } from "./context.js";
+import { clearCachedContext, formatLastRecallInspection, renderCachedContext } from "./context.js";
 import {
   type BankStrategy,
   type RecallMode,
@@ -216,9 +216,6 @@ const runSetupWizard = async (ctx: ExtensionContext): Promise<void> => {
     bankId: manualBankId || undefined,
     bankStrategy: bankStrategyInput === "Use fixed bank ID" ? "manual" : "per-repo",
     recallMode: normalizeRecallMode(recallModeInput) as RecallMode,
-    recallTypes: ["observation", "experience"],
-    recallPerType: 2,
-    recallDisplayMode: "grouped",
     injectionFrequency: "first-turn",
     retainMode: retainModeInput as any,
     stepRetainThreshold: 5,
@@ -235,18 +232,6 @@ const runSetupWizard = async (ctx: ExtensionContext): Promise<void> => {
 const runRecallWizard = async (ctx: ExtensionContext): Promise<void> => {
   const existing = await resolveConfig(ctx.cwd);
   const draft = await runStepLoop(ctx, [
-    async (_state, allowBack) => {
-      const result = await chooseRecallTypes(ctx, existing.recallTypes, allowBack);
-      return result.kind === "next" ? { kind: "next", value: { recallTypesInput: result.value } } : result;
-    },
-    async (_state, allowBack) => {
-      const result = await inputWizardAction(ctx, "Recall count per type", String(existing.recallPerType), "2", allowBack);
-      return result.kind === "next" ? { kind: "next", value: { recallPerTypeInput: result.value } } : result;
-    },
-    async (_state, allowBack) => {
-      const result = await selectWizardAction(ctx, "Recall display mode", uniqueOptions(existing.recallDisplayMode, ["grouped", "unified"]), allowBack);
-      return result.kind === "next" ? { kind: "next", value: { recallDisplayInput: result.value } } : result;
-    },
     async (_state, allowBack) => {
       const result = await selectWizardAction(ctx, "Search budget\nRecommended: mid", uniqueOptions(existing.searchBudget, ["low", "mid", "high"]), allowBack);
       return result.kind === "next" ? { kind: "next", value: { searchBudgetInput: result.value } } : result;
@@ -303,9 +288,6 @@ const runRecallWizard = async (ctx: ExtensionContext): Promise<void> => {
   if (!draft) return;
 
   await saveConfig({
-    recallTypes: normalizeRecallTypes(parseCsv(draft.recallTypesInput)),
-    recallPerType: parsePositiveInt(draft.recallPerTypeInput, existing.recallPerType),
-    recallDisplayMode: draft.recallDisplayInput === "unified" ? "unified" : "grouped",
     searchBudget: draft.searchBudgetInput === "low" || draft.searchBudgetInput === "high" ? draft.searchBudgetInput : "mid",
     reflectBudget: draft.reflectBudgetInput === "mid" || draft.reflectBudgetInput === "high" ? draft.reflectBudgetInput : "low",
     contextTokens: parsePositiveInt(draft.contextTokensInput, existing.contextTokens),
@@ -322,7 +304,7 @@ const runRecallWizard = async (ctx: ExtensionContext): Promise<void> => {
   const updated = await resolveConfig(ctx.cwd);
   setRecallMode(updated.recallMode);
   await connect(ctx);
-  ctx.ui.notify(`Recall settings saved: mode=${updated.recallMode}, injection=${updated.injectionFrequency}, cadence=${updated.contextCadence}`, "success");
+  ctx.ui.notify(`Recall settings saved: mode=${updated.recallMode}, injection=${updated.injectionFrequency}, reflect=${updated.reflectBudget}`, "success");
 };
 
 const runRetainWizard = async (ctx: ExtensionContext): Promise<void> => {
@@ -463,8 +445,7 @@ const connect = async (ctx: ExtensionContext): Promise<void> => {
     throw new Error("Hindsight is disabled.");
   }
   try {
-    const handles = await bootstrap(config, ctx.cwd);
-    await refreshCachedContext(handles);
+    await bootstrap(config, ctx.cwd);
     updateStatusBar(ctx, "connected");
   } catch (error) {
     updateStatusBar(ctx, "offline");
@@ -510,9 +491,7 @@ const statusText = async (ctx: ExtensionContext): Promise<string> => {
     `Entities: ${insights.entitiesCount ?? "unknown"}`,
     `Strategy: ${config.bankStrategy}`,
     `Recall mode: ${config.recallMode}`,
-    `Recall types: ${config.recallTypes.join(", ")}`,
-    `Recall per type: ${config.recallPerType}`,
-    `Recall display: ${config.recallDisplayMode}`,
+    `Memory query mode: fresh recall across all memory types`,
     `Search budget: ${config.searchBudget}`,
     `Reflect budget: ${config.reflectBudget}`,
     `Reflect dynamic budget: ${config.dialecticDynamic ? "on" : "off"}`,
@@ -523,7 +502,8 @@ const statusText = async (ctx: ExtensionContext): Promise<string> => {
     `Step retain threshold: ${config.stepRetainThreshold}`,
     `Auto-create bank: ${config.autoCreateBank ? "yes" : "no"}`,
     `Injection: ${config.injectionFrequency}`,
-    `Context TTL: ${config.contextRefreshTtlSeconds}s`,
+    `Recall freshness: queried fresh from current user prompt each turn (no session cache)`,
+    `Deprecated context TTL knob: ${config.contextRefreshTtlSeconds}s`,
     `Tool preview length: ${config.toolPreviewLength}`,
     `Max message length: ${config.maxMessageLength}`,
     `Save messages: ${config.saveMessages ? "yes" : "no"}`,
@@ -532,7 +512,7 @@ const statusText = async (ctx: ExtensionContext): Promise<string> => {
     `Hook session_start: ${hookText("sessionStart")}`,
     `Hook recall: ${hookText("recall")}`,
     `Hook retain: ${hookText("retain")}`,
-    `Cache: ${cache ? `${cache.length} chars` : "empty"}`,
+    `Last recall payload: ${cache ? `${cache.length} chars` : "empty"}`,
   ].join("\n");
 };
 
@@ -612,7 +592,7 @@ export const registerCommands = (pi: ExtensionAPI): void => {
       checks.push(`global_bank: ${config.globalBankId ?? "none"}`);
       checks.push(`linked_hosts: ${config.linkedHosts.length > 0 ? config.linkedHosts.join(", ") : "none"}`);
       checks.push(`bank_strategy: ${config.bankStrategy}`);
-      checks.push(`recall_types: ${config.recallTypes.join(",")}`);
+      checks.push(`memory_query_mode: recall`);
       checks.push(`reasoning_level: ${config.reasoningLevel}`);
       checks.push(`reflect_dynamic_budget: ${config.dialecticDynamic ? "on" : "off"}`);
 
@@ -625,7 +605,7 @@ export const registerCommands = (pi: ExtensionAPI): void => {
       try {
         const handles = await bootstrap(config, ctx.cwd);
         await ensureBank(handles.client, handles.bankId, handles.config);
-        await handles.client.recall(handles.bankId, "health check", { budget: "low", maxTokens: 256, types: config.recallTypes });
+        await handles.client.recall(handles.bankId, "health check", { budget: "low", maxTokens: 128 });
         const insights = await getBankInsights(config.baseUrl, config.apiKey, handles.bankId).catch(() => null);
         checks.push(`active_bank: ${handles.bankId}`);
         checks.push(`connectivity: ok`);
@@ -680,7 +660,7 @@ export const registerCommands = (pi: ExtensionAPI): void => {
   });
 
   pi.registerCommand("hindsight:sync", {
-    description: "Force Hindsight cache refresh",
+    description: "Clear last recall inspection state so the next user turn fetches fresh recall",
     handler: async (_args: string, ctx: ExtensionContext) => {
       const handles = getHandles();
       if (!handles) {
@@ -688,9 +668,15 @@ export const registerCommands = (pi: ExtensionAPI): void => {
         return;
       }
       clearCachedContext();
-      await refreshCachedContext(handles);
       updateStatusBar(ctx, "connected");
-      ctx.ui.notify("Hindsight cache refreshed.", "success");
+      ctx.ui.notify("Cleared last recall preview. Hindsight recall is fetched fresh from the next user prompt.", "success");
+    },
+  });
+
+  pi.registerCommand("hindsight:inspect-last-recall", {
+    description: "Show the exact last Hindsight recall result set loaded for inspection",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      ctx.ui.notify(formatLastRecallInspection(), "info");
     },
   });
 

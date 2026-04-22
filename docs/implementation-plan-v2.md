@@ -11,6 +11,9 @@ Implement architecture v2 in controlled phases so `hindsight-pi` becomes stable 
 
 Principles:
 - freeze target architecture before major code churn
+- fresh `recall()` with ephemeral injection is the default auto-context path; `reflect` is explicit synthesis only
+- no cached recall context as a primary runtime design; per-turn recall must follow the current user prompt
+- consolidation is background work and must not gate every-turn memory injection
 - land foundation before UX cleanup
 - keep migration path from current behavior
 - expand tests as each phase lands
@@ -139,37 +142,40 @@ Tests:
 ## Phase 4 — fresh recall redesign
 
 Goal:
-- remove session-level cached recall anti-pattern
+- remove the session-level cached recall anti-pattern and make recall inspection deterministic without relying on model narration
 
 Tasks:
-- [ ] Replace session cached recall blob with per-turn recall fetch
+- [ ] Replace session cached recall blob with per-turn `client.recall(...)` fetch
 - [ ] Derive recall query from current user message
 - [ ] Add normalization/meaningful-message extraction
 - [ ] Handle short prompts like `continue`
-- [ ] Keep grouped/unified rendering
 - [ ] Keep first-turn injection option
 - [ ] Keep tools-only mode
+- [ ] Add extension-side storage of the last recall result set
+- [ ] Add `/hindsight:inspect-last-recall`
 - [ ] Add optional identical-request micro-cache only if justified
 - [ ] Remove obsolete TTL/cadence refresh behavior from runtime
 - [ ] Ensure recalled memory is never re-retained
+- [ ] Remove prompt-bloat instructions that try to make the model describe hidden memory
 
 Files likely touched:
 - `extensions/context.ts` or replacement files
 - `extensions/index.ts`
+- `extensions/commands.ts`
 - `extensions/config.ts`
 
 Deliverables:
 - `buildRecallRequest(...)`
 - `fetchRecallForTurn(...)`
 - `renderRecallBlock(...)`
+- `inspectLastRecall()` or equivalent command-backed formatter
 
 Tests:
 - [ ] different prompt => fresh recall call
-- [ ] grouped rendering correct
-- [ ] unified rendering correct
+- [ ] no stale session cache behavior remains
 - [ ] first-turn only respected
 - [ ] tools mode avoids auto injection
-- [ ] no stale session cache behavior remains
+- [ ] inspect path shows exactly what was loaded
 
 ## Phase 5 — Hindsight append transport
 
@@ -297,6 +303,8 @@ Tasks:
 - [ ] Update README for v2 behavior
 - [ ] Add migration notes from v1 behavior
 - [ ] Document why recall is fresh-per-turn
+- [ ] Document why recall should be ephemerally injected, not transcript-visible
+- [ ] Document why extension-owned inspect-last-recall UX is better than asking the model to narrate hidden memory
 - [ ] Document why session append is primary durable model
 - [ ] Document why indicators are UI-only by default
 - [ ] Document advanced/experimental features separately
@@ -339,16 +347,21 @@ Reason:
 
 These are approved for implementation:
 - [x] Default recall mode: `tools`
+- [x] Default per-turn auto-context path: fresh `recall()` with ephemeral injection when auto-context is enabled
+- [x] No session-level cached recall context as a primary design
 - [x] Default retain backend: session append primary, legacy advanced compatibility mode retained temporarily
 - [x] Project config remains fully supported
 - [x] Linked hosts becomes experimental/hidden from normal UX
 - [x] Keep `#nomem` / `#skip`
 - [x] Auto bank creation in official mode disabled by default
+- [x] Consolidation is background work and does not gate every-turn recall injection
 
 ## Success criteria
 
 Implementation plan v2 is complete when:
 - [ ] recall uses current-turn query
+- [ ] recall is ephemerally injected, not transcript-visible
+- [ ] inspect-last-recall shows exactly what was loaded without model narration
 - [ ] stable session document ID exists
 - [ ] retain uses structured append records
 - [ ] queue survives restart/offline

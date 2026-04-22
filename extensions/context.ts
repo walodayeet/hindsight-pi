@@ -1,28 +1,53 @@
 import type { HindsightHandles } from "./client.js";
 
-interface CachedContext {
-  text: string | null;
-  refreshedAt: number | null;
-  pinned: boolean;
+export interface RecallResultSnapshot {
+  text: string;
+  type?: string;
+  sourceLabel?: string;
+  documentId?: string | null;
+  context?: string | null;
+  tags?: string[];
+  metadata?: Record<string, unknown> | null;
 }
 
-const EMPTY: CachedContext = { text: null, refreshedAt: null, pinned: false };
-let cachedContext: CachedContext = EMPTY;
-let messagesSinceRefresh = 0;
-export let pendingRefresh: Promise<void> | null = null;
+export interface LastRecallState {
+  text: string | null;
+  previewLines: string[];
+  resultCount: number;
+  loadedAt: number | null;
+  query: string | null;
+  results: RecallResultSnapshot[];
+}
+
+const EMPTY: LastRecallState = {
+  text: null,
+  previewLines: [],
+  resultCount: 0,
+  loadedAt: null,
+  query: null,
+  results: [],
+};
+
+let lastRecallState: LastRecallState = EMPTY;
 
 const uniqueBankIds = (handles: HindsightHandles): string[] => {
   const ids = [handles.bankId, handles.config.globalBankId].filter((value): value is string => Boolean(value));
   return [...new Set(ids)];
 };
 
-export const clearCachedContext = (): void => {
-  cachedContext = EMPTY;
-  messagesSinceRefresh = 0;
+const META_MEMORY_RECALL_RE = /\b(what memory do you have|what was recalled|what got recalled|what was loaded|what got loaded|don't use any tools|do not use any tools|hindsight_context|hidden recalled payload|visible recall state|raw hidden recalled payload|memory context loaded)\b/i;
+
+const shouldDropRecallResult = (result: RecallResultSnapshot, query: string): boolean => {
+  if (META_MEMORY_RECALL_RE.test(result.text)) return true;
+  if (!/\b(architecture|design|reflect|recall|memory system|prompt caching|system prompt)\b/i.test(query)
+      && /\b(prompt caching|system prompt injection|reflect-based path|recall-type settings)\b/i.test(result.text)) {
+    return true;
+  }
+  return false;
 };
 
-export const incrementMessageCount = (count: number): void => {
-  messagesSinceRefresh += count;
+export const clearCachedContext = (): void => {
+  lastRecallState = EMPTY;
 };
 
 const truncateToBudget = (text: string, tokens: number): string => {
@@ -30,83 +55,114 @@ const truncateToBudget = (text: string, tokens: number): string => {
   return text.length > budgetChars ? `${text.slice(0, budgetChars)}…` : text;
 };
 
-const renderResults = (results: Array<{ text?: string; type?: string }>, contextTokens: number, displayMode: "grouped" | "unified"): string | null => {
-  if (results.length === 0) return null;
-  if (displayMode === "unified") {
-    const lines = results
-      .map((result) => result.text?.trim())
-      .filter((value): value is string => Boolean(value))
-      .map((text) => `- ${text}`);
-    if (lines.length === 0) return null;
-    return truncateToBudget(`[Persistent memory]\n${lines.join("\n")}`, contextTokens);
-  }
-  const grouped = new Map<string, string[]>();
-  for (const result of results) {
-    const type = result.type ?? "memory";
-    const text = result.text?.trim();
-    if (!text) continue;
-    const bucket = grouped.get(type) ?? [];
-    bucket.push(`- ${text}`);
-    grouped.set(type, bucket);
-  }
-  const sections = [...grouped.entries()].map(([type, items]) => `${type}:\n${items.join("\n")}`);
-  if (sections.length === 0) return null;
-  return truncateToBudget(`[Persistent memory]\n${sections.join("\n\n")}`, contextTokens);
+const compactLine = (value: string): string => {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > 140 ? `${normalized.slice(0, 140)}…` : normalized;
 };
 
-export const refreshCachedContext = async (handles: HindsightHandles): Promise<void> => {
-  const query = "What user preferences, durable project facts, architecture facts, and recent coding context matter for this pi workspace?";
-  const settled = await Promise.allSettled(uniqueBankIds(handles).flatMap((bankId) =>
-    handles.config.recallTypes.map(async (type) => {
-      const result = await handles.client.recall(bankId, query, {
-        budget: handles.config.searchBudget,
-        maxTokens: Math.max(handles.config.contextTokens * 2, 512),
-        types: [type],
-      });
-      return (result?.results ?? []).slice(0, handles.config.recallPerType).map((entry: any) => ({ ...entry, type }));
-    }),
-  ));
-
-  const results = settled
-    .filter((entry): entry is PromiseFulfilledResult<Array<{ text?: string; type?: string }>> => entry.status === "fulfilled")
-    .map((entry) => entry.value)
-    .flat();
-
-  cachedContext = {
-    text: renderResults(results, handles.config.contextTokens, handles.config.recallDisplayMode),
-    refreshedAt: Date.now(),
-    pinned: false,
+const normalizeRecallEntry = (result: any, sourceLabel?: string): RecallResultSnapshot | null => {
+  const text = typeof result?.text === "string" ? result.text.trim() : "";
+  if (!text) return null;
+  return {
+    text,
+    type: typeof result?.type === "string" ? result.type : undefined,
+    sourceLabel,
+    documentId: typeof result?.document_id === "string" ? result.document_id : null,
+    context: typeof result?.context === "string" ? result.context : null,
+    tags: Array.isArray(result?.tags) ? result.tags.filter((tag: unknown): tag is string => typeof tag === "string") : undefined,
+    metadata: result?.metadata && typeof result.metadata === "object" ? result.metadata as Record<string, unknown> : null,
   };
-  messagesSinceRefresh = 0;
 };
 
-export const pinCachedContext = (): void => {
-  if (cachedContext.refreshedAt !== null) cachedContext.pinned = true;
-};
-
-export const backgroundRefresh = (handles: HindsightHandles): void => {
-  pendingRefresh = refreshCachedContext(handles).finally(() => {
-    pendingRefresh = null;
+const renderRecallResults = (results: RecallResultSnapshot[], contextTokens: number): string | null => {
+  const usable = results.map((result) => {
+    const label = result.type ? `[${result.type}]` : "[memory]";
+    return `- ${label} ${result.text}`;
   });
+  if (usable.length === 0) return null;
+  const block = [
+    "# Hindsight Memories",
+    "- recalled for current user turn",
+    "",
+    "<hindsight_memories>",
+    ...usable,
+    "</hindsight_memories>",
+  ].join("\n");
+  return truncateToBudget(block, contextTokens);
 };
 
-export const shouldRefreshCachedContext = (handles: HindsightHandles): boolean => {
-  if (cachedContext.pinned) return false;
-  if (cachedContext.refreshedAt === null) return true;
-  const ttlExpired = (Date.now() - cachedContext.refreshedAt) / 1000 >= handles.config.contextRefreshTtlSeconds;
-  const thresholdExceeded = messagesSinceRefresh >= handles.config.contextRefreshMessageThreshold;
-  return ttlExpired || thresholdExceeded;
+export const refreshContextForPrompt = async (handles: HindsightHandles, prompt: string): Promise<void> => {
+  const trimmedPrompt = prompt.trim();
+  if (!trimmedPrompt) {
+    lastRecallState = EMPTY;
+    return;
+  }
+
+  const results: RecallResultSnapshot[] = [];
+
+  for (const bankId of uniqueBankIds(handles)) {
+    const recall = await handles.client.recall(bankId, trimmedPrompt, {
+      budget: handles.config.searchBudget,
+      maxTokens: Math.max(handles.config.contextTokens, 512),
+    });
+    const sourceLabel = bankId === handles.bankId ? handles.config.workspace : `${handles.config.workspace}:global`;
+    results.push(...(recall?.results ?? [])
+      .map((entry: any) => normalizeRecallEntry(entry, sourceLabel))
+      .filter((entry: RecallResultSnapshot | null): entry is RecallResultSnapshot => Boolean(entry)));
+  }
+
+  for (const linked of handles.linked) {
+    try {
+      const recall = await linked.client.recall(linked.bankId, trimmedPrompt, {
+        budget: handles.config.searchBudget,
+        maxTokens: Math.max(handles.config.contextTokens, 512),
+      });
+      results.push(...(recall?.results ?? [])
+        .map((entry: any) => normalizeRecallEntry(entry, linked.name))
+        .filter((entry: RecallResultSnapshot | null): entry is RecallResultSnapshot => Boolean(entry)));
+    } catch (error) {
+      if (handles.config.logging) console.warn(`[hindsight-pi] linked recall failed for ${linked.name}:`, error instanceof Error ? error.message : error);
+    }
+  }
+
+  const filteredResults = results.filter((result) => !shouldDropRecallResult(result, trimmedPrompt));
+  const text = renderRecallResults(filteredResults, handles.config.contextTokens);
+  lastRecallState = {
+    text,
+    previewLines: filteredResults.map((result) => compactLine(result.text)).filter(Boolean).slice(0, 6),
+    resultCount: filteredResults.length,
+    loadedAt: Date.now(),
+    query: trimmedPrompt,
+    results: filteredResults,
+  };
 };
 
-export const renderCachedContext = (): string | null => cachedContext.text;
+export const renderCachedContext = (): string | null => lastRecallState.text;
+export const countCachedContext = (): number => lastRecallState.resultCount;
+export const previewCachedContext = (limit = 3): string[] => lastRecallState.previewLines.slice(0, limit);
+export const getLastRecallState = (): LastRecallState => lastRecallState;
 
-export const previewCachedContext = (limit = 3): string[] => {
-  if (!cachedContext.text) return [];
-  const lines = cachedContext.text
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith("- "))
-    .slice(0, limit)
-    .map((line) => line.slice(2));
-  return lines;
+export const formatLastRecallInspection = (): string => {
+  if (!lastRecallState.loadedAt || lastRecallState.results.length === 0) {
+    return "No Hindsight recall has been loaded yet for this session.";
+  }
+
+  const header = [
+    `Query: ${lastRecallState.query ?? "(unknown)"}`,
+    `Loaded: ${new Date(lastRecallState.loadedAt).toISOString()}`,
+    `Results: ${lastRecallState.results.length}`,
+    "",
+    "Loaded recall results:",
+  ];
+
+  const lines = lastRecallState.results.flatMap((result, index) => {
+    const detail: string[] = [`${index + 1}. [${result.type ?? "memory"}] ${result.text}`];
+    if (result.sourceLabel) detail.push(`   source: ${result.sourceLabel}`);
+    if (result.documentId) detail.push(`   document_id: ${result.documentId}`);
+    if (result.context) detail.push(`   context: ${result.context}`);
+    if (result.tags?.length) detail.push(`   tags: ${result.tags.join(", ")}`);
+    return detail;
+  });
+
+  return [...header, ...lines].join("\n");
 };
