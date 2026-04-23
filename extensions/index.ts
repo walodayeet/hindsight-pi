@@ -36,6 +36,11 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
   let pendingRecallIndicator: { config: any; content: string; details: Record<string, unknown> } | null = null;
   let currentUi: { notify(message: string, level?: string): void } | null = null;
   let lastMeaningfulRecallQuery: string | null = null;
+  let pendingRecallQuery: string | null = null;
+  let pendingRecallConfig: any | null = null;
+  let pendingInspectionHint = "";
+  let recallInjectedForCurrentAgent = false;
+  let pendingToolHint = "";
 
   const emitIndicator = (config: any, type: string, content: string, details: Record<string, unknown> = {}): void => {
     if ((type === RECALL_MESSAGE_TYPE && !config.showRecallIndicator) || (type === RETAIN_MESSAGE_TYPE && !config.showRetainIndicator)) return;
@@ -95,6 +100,11 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
         turnCount = 0;
         lastContextTurn = 0;
         lastMeaningfulRecallQuery = null;
+        pendingRecallQuery = null;
+        pendingRecallConfig = null;
+        pendingInspectionHint = "";
+        pendingToolHint = "";
+        recallInjectedForCurrentAgent = false;
         scheduler?.reset();
         scheduler = null;
         retainInFlight = Promise.resolve();
@@ -137,83 +147,128 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     initialize(ctx);
   });
 
-  pi.on("before_agent_start", async (event: any, ctx: any) => {
+  pi.on("before_agent_start", async (event: any) => {
     if (initializing) await initializing;
     const recallMode = getRecallMode();
-    if (recallMode === "tools" || recallMode === "off") return;
+    if (recallMode === "tools" || recallMode === "off") {
+      pendingRecallQuery = null;
+      pendingRecallConfig = null;
+      pendingInspectionHint = "";
+      pendingToolHint = "";
+      return;
+    }
     const handles = getHandles();
     if (!handles) return;
 
     turnCount += 1;
+    recallInjectedForCurrentAgent = false;
+    pendingRecallIndicator = null;
     const rawPrompt = (event.prompt ?? "").trim();
     const forceRecallForInspection = SHOULD_FORCE_RECALL_RE.test(rawPrompt);
+    const isContinuePrompt = CONTINUE_RE.test(rawPrompt);
     const derivedRecallQuery = forceRecallForInspection
       ? (lastMeaningfulRecallQuery ?? FALLBACK_RECALL_QUERY)
-      : CONTINUE_RE.test(rawPrompt) && lastMeaningfulRecallQuery
+      : isContinuePrompt && lastMeaningfulRecallQuery
         ? lastMeaningfulRecallQuery
         : rawPrompt;
-    if (!forceRecallForInspection && handles.config.injectionFrequency === "first-turn" && turnCount > 1) return;
+    const shouldSkipAutoRecall = !forceRecallForInspection
+      && handles.config.injectionFrequency === "first-turn"
+      && turnCount > 1
+      && isContinuePrompt;
+    if (shouldSkipAutoRecall || !derivedRecallQuery) {
+      pendingRecallQuery = null;
+      pendingRecallConfig = null;
+      pendingInspectionHint = "";
+      pendingToolHint = "";
+      return;
+    }
+
+    lastContextTurn = turnCount;
+    if (!forceRecallForInspection && rawPrompt) lastMeaningfulRecallQuery = rawPrompt;
+    pendingRecallQuery = derivedRecallQuery;
+    pendingRecallConfig = handles.config;
+    pendingInspectionHint = forceRecallForInspection
+      ? "\n\nIf the user asks what memory is loaded or what is in current context, answer from the loaded <hindsight_memories> block directly. Do not say no memory was loaded if the block is present."
+      : "";
+    pendingToolHint = recallMode === "hybrid"
+      ? "\n\nUse hindsight_search for raw facts, hindsight_context for deeper synthesis beyond already loaded memory, and hindsight_retain when user explicitly wants something remembered."
+      : "";
+  });
+
+  pi.on("agent_start", async () => {
+    recallInjectedForCurrentAgent = false;
+  });
+
+  pi.on("context", async (event: any, ctx: any) => {
+    const handles = getHandles();
+    if (!handles || !pendingRecallQuery || recallInjectedForCurrentAgent) return;
 
     setStatus(ctx, "recalling");
-    ctx.ui.setWorkingMessage("Recalling Hindsight memory…");
-    ctx.ui.setWorkingIndicator({
-      frames: [
-        ctx.ui.theme.fg("accent", "🧠"),
-        ctx.ui.theme.fg("muted", "🧠"),
-        ctx.ui.theme.fg("dim", "🧠"),
-      ],
-      intervalMs: 140,
-    });
+    currentUi?.notify("🧠 Hindsight recalling…", "info");
 
     try {
-      await refreshContextForPrompt(handles, derivedRecallQuery);
-      lastContextTurn = turnCount;
-      if (!forceRecallForInspection && rawPrompt) lastMeaningfulRecallQuery = rawPrompt;
-
+      const recallStartedAt = Date.now();
+      await refreshContextForPrompt(handles, pendingRecallQuery);
+      const recallDurationMs = Date.now() - recallStartedAt;
       const memory = renderCachedContext();
       if (!memory) {
         setHookStat("recall", { firedAt: new Date().toISOString(), result: "skipped", detail: "empty" });
+        recallInjectedForCurrentAgent = true;
+        pendingRecallQuery = null;
+        pendingRecallConfig = null;
+        pendingInspectionHint = "";
+        pendingToolHint = "";
         pendingRecallIndicator = null;
         return;
       }
+
       const totalResults = Math.max(countCachedContext(), 1);
       const previews = previewCachedContext(Math.min(totalResults, 6));
       setHookStat("recall", { firedAt: new Date().toISOString(), result: "ok", detail: `recall:${totalResults}` });
+      recallInjectedForCurrentAgent = true;
       pendingRecallIndicator = {
         config: handles.config,
-        content: "🧠 HINDSIGHT RECALL · memory context loaded",
+        content: `🧠 HINDSIGHT RECALL · memory context loaded${recallDurationMs > 0 ? ` in ${recallDurationMs}ms` : ""}`,
         details: {
           bankId: handles.bankId,
           previews,
           chars: memory.length,
           resultCount: totalResults,
-          query: derivedRecallQuery,
+          query: pendingRecallQuery,
+          durationMs: recallDurationMs,
         },
       };
-      const inspectionHint = forceRecallForInspection
-        ? "\n\nIf the user asks what memory is loaded or what is in current context, answer from the loaded <hindsight_memories> block directly. Do not say no memory was loaded if the block is present."
-        : "";
-      const toolHint = recallMode === "hybrid"
-        ? "\n\nUse hindsight_search for raw facts, hindsight_context for deeper synthesis beyond already loaded memory, and hindsight_retain when user explicitly wants something remembered."
-        : "";
+      const contextMessage = {
+        role: "custom",
+        customType: "hindsight-context",
+        content: `${memory}${pendingInspectionHint}${pendingToolHint}`,
+        display: false,
+        details: {
+          bankId: handles.bankId,
+          query: pendingRecallQuery,
+        },
+        timestamp: Date.now(),
+      };
+      pendingRecallQuery = null;
+      pendingRecallConfig = null;
+      pendingInspectionHint = "";
+      pendingToolHint = "";
+      emitIndicator(handles.config, RECALL_MESSAGE_TYPE, pendingRecallIndicator.content, pendingRecallIndicator.details);
+      pendingRecallIndicator = null;
       return {
-        systemPrompt: `${event.systemPrompt}\n\n${memory}${inspectionHint}${toolHint}`,
+        messages: [...event.messages, contextMessage],
       };
     } finally {
-      ctx.ui.setWorkingMessage();
-      ctx.ui.setWorkingIndicator();
       setStatus(ctx, "connected");
     }
   });
 
-  pi.on("agent_start", async () => {
-    if (!pendingRecallIndicator) return;
-    const indicator = pendingRecallIndicator;
-    pendingRecallIndicator = null;
-    emitIndicator(indicator.config, RECALL_MESSAGE_TYPE, indicator.content, indicator.details);
-  });
-
   pi.on("agent_end", async (event: any, ctx: any) => {
+    recallInjectedForCurrentAgent = false;
+    pendingRecallQuery = null;
+    pendingRecallConfig = null;
+    pendingInspectionHint = "";
+    pendingToolHint = "";
     const handles = getHandles();
     if (!handles || !handles.config.saveMessages) return;
     setStatus(ctx, "syncing");

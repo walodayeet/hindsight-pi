@@ -216,7 +216,7 @@ const runSetupWizard = async (ctx: ExtensionContext): Promise<void> => {
     bankId: manualBankId || undefined,
     bankStrategy: bankStrategyInput === "Use fixed bank ID" ? "manual" : "per-repo",
     recallMode: normalizeRecallMode(recallModeInput) as RecallMode,
-    injectionFrequency: "first-turn",
+    injectionFrequency: "every-turn",
     retainMode: retainModeInput as any,
     stepRetainThreshold: 5,
     writeFrequency: "turn",
@@ -257,7 +257,7 @@ const runRecallWizard = async (ctx: ExtensionContext): Promise<void> => {
       return result.kind === "next" ? { kind: "next", value: { thresholdInput: result.value } } : result;
     },
     async (_state, allowBack) => {
-      const result = await selectWizardAction(ctx, "Injection frequency\nRecommended: first-turn if you care about prompt caching", uniqueOptions(existing.injectionFrequency, ["first-turn", "every-turn"]), allowBack);
+      const result = await selectWizardAction(ctx, "Injection frequency\nRecommended: every-turn for fresh recall. first-turn now mainly affects continue/next-style follow-ups if you want more cache stability", uniqueOptions(existing.injectionFrequency, ["every-turn", "first-turn"]), allowBack);
       return result.kind === "next" ? { kind: "next", value: { injectionInput: result.value } } : result;
     },
     async (_state, allowBack) => {
