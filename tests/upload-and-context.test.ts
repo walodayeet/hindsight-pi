@@ -91,6 +91,35 @@ describe("context helpers", () => {
     expect(formatLastRecallInspection()).not.toContain("Visible recall state");
   });
 
+  it("skips gracefully when recall query is too long", async () => {
+    clearCachedContext();
+    const seen: string[] = [];
+    const handles = {
+      bankId: "bank-1",
+      config: {
+        workspace: "pi",
+        searchBudget: "mid",
+        contextTokens: 512,
+        logging: false,
+        globalBankId: undefined,
+      },
+      linked: [],
+      client: {
+        recall: async (_bankId: string, query: string) => {
+          seen.push(query);
+          throw new Error(`Query too long: exceeds maximum of 500`);
+        },
+      },
+    } as any;
+
+    await refreshContextForPrompt(handles, "x".repeat(2400));
+
+    expect(seen.length).toBe(1);
+    expect(countCachedContext()).toBe(0);
+    expect(renderCachedContext()).toBeNull();
+    expect(getLastRecallState().errorReason).toBe("query-too-long");
+  });
+
   it("clears last recall inspection state", () => {
     clearCachedContext();
     expect(formatLastRecallInspection()).toContain("No Hindsight recall has been loaded yet");

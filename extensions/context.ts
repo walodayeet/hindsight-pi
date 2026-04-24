@@ -17,6 +17,7 @@ export interface LastRecallState {
   loadedAt: number | null;
   query: string | null;
   results: RecallResultSnapshot[];
+  errorReason?: "query-too-long" | "failed";
 }
 
 const EMPTY: LastRecallState = {
@@ -26,6 +27,7 @@ const EMPTY: LastRecallState = {
   loadedAt: null,
   query: null,
   results: [],
+  errorReason: undefined,
 };
 
 let lastRecallState: LastRecallState = EMPTY;
@@ -91,8 +93,20 @@ const renderRecallResults = (results: RecallResultSnapshot[], contextTokens: num
   return truncateToBudget(block, contextTokens);
 };
 
+const normalizeRecallQuery = (prompt: string): string => prompt.replace(/\s+/g, " ").trim();
+
+const shrinkRecallQuery = (query: string, maxChars: number): string => {
+  const normalized = normalizeRecallQuery(query);
+  return normalized.length <= maxChars ? normalized : normalized.slice(0, maxChars).trim();
+};
+
+const isQueryTooLongError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return /query too long|exceeds maximum of 500/i.test(message);
+};
+
 export const refreshContextForPrompt = async (handles: HindsightHandles, prompt: string): Promise<void> => {
-  const trimmedPrompt = prompt.trim();
+  const trimmedPrompt = normalizeRecallQuery(prompt);
   if (!trimmedPrompt) {
     lastRecallState = EMPTY;
     return;
@@ -100,15 +114,26 @@ export const refreshContextForPrompt = async (handles: HindsightHandles, prompt:
 
   const results: RecallResultSnapshot[] = [];
 
-  for (const bankId of uniqueBankIds(handles)) {
-    const recall = await handles.client.recall(bankId, trimmedPrompt, {
-      budget: handles.config.searchBudget,
-      maxTokens: Math.max(handles.config.contextTokens, 512),
-    });
-    const sourceLabel = bankId === handles.bankId ? handles.config.workspace : `${handles.config.workspace}:global`;
-    results.push(...(recall?.results ?? [])
-      .map((entry: any) => normalizeRecallEntry(entry, sourceLabel))
-      .filter((entry: RecallResultSnapshot | null): entry is RecallResultSnapshot => Boolean(entry)));
+  try {
+    for (const bankId of uniqueBankIds(handles)) {
+      const recall = await handles.client.recall(bankId, trimmedPrompt, {
+        budget: handles.config.searchBudget,
+        maxTokens: Math.max(handles.config.contextTokens, 512),
+      });
+      const sourceLabel = bankId === handles.bankId ? handles.config.workspace : `${handles.config.workspace}:global`;
+      results.push(...(recall?.results ?? [])
+        .map((entry: any) => normalizeRecallEntry(entry, sourceLabel))
+        .filter((entry: RecallResultSnapshot | null): entry is RecallResultSnapshot => Boolean(entry)));
+    }
+  } catch (error) {
+    if (handles.config.logging) console.warn(`[hindsight-pi] primary recall failed:`, error instanceof Error ? error.message : error);
+    lastRecallState = {
+      ...EMPTY,
+      loadedAt: Date.now(),
+      query: shrinkRecallQuery(trimmedPrompt, 320),
+      errorReason: isQueryTooLongError(error) ? "query-too-long" : "failed",
+    };
+    return;
   }
 
   for (const linked of handles.linked) {
@@ -132,8 +157,9 @@ export const refreshContextForPrompt = async (handles: HindsightHandles, prompt:
     previewLines: filteredResults.map((result) => compactLine(result.text)).filter(Boolean).slice(0, 6),
     resultCount: filteredResults.length,
     loadedAt: Date.now(),
-    query: trimmedPrompt,
+    query: shrinkRecallQuery(trimmedPrompt, 320),
     results: filteredResults,
+    errorReason: undefined,
   };
 };
 
@@ -141,6 +167,7 @@ export const renderCachedContext = (): string | null => lastRecallState.text;
 export const countCachedContext = (): number => lastRecallState.resultCount;
 export const previewCachedContext = (limit = 3): string[] => lastRecallState.previewLines.slice(0, limit);
 export const getLastRecallState = (): LastRecallState => lastRecallState;
+export const getLastRecallErrorReason = (): LastRecallState["errorReason"] => lastRecallState.errorReason;
 
 export const formatLastRecallInspection = (): string => {
   if (!lastRecallState.loadedAt || lastRecallState.results.length === 0) {

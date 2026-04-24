@@ -3,7 +3,7 @@ import { Box, Text } from "@mariozechner/pi-tui";
 import { bootstrap, clearHandles, getHandles } from "./client.js";
 import { registerCommands } from "./commands.js";
 import { getRecallMode, resolveConfig } from "./config.js";
-import { clearCachedContext, countCachedContext, previewCachedContext, refreshContextForPrompt, renderCachedContext } from "./context.js";
+import { clearCachedContext, countCachedContext, getLastRecallErrorReason, previewCachedContext, refreshContextForPrompt, renderCachedContext } from "./context.js";
 import { registerTools } from "./tools.js";
 import { WriteScheduler } from "./upload.js";
 import { resetHookStats, setHookStat } from "./hooks.js";
@@ -36,6 +36,7 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
   let pendingRecallIndicator: { config: any; content: string; details: Record<string, unknown> } | null = null;
   let currentUi: { notify(message: string, level?: string): void } | null = null;
   let lastMeaningfulRecallQuery: string | null = null;
+  let lastRawUserInput: string | null = null;
   let pendingRecallQuery: string | null = null;
   let pendingRecallConfig: any | null = null;
   let pendingInspectionHint = "";
@@ -100,6 +101,7 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
         turnCount = 0;
         lastContextTurn = 0;
         lastMeaningfulRecallQuery = null;
+        lastRawUserInput = null;
         pendingRecallQuery = null;
         pendingRecallConfig = null;
         pendingInspectionHint = "";
@@ -147,6 +149,10 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     initialize(ctx);
   });
 
+  pi.on("input", async (event: any) => {
+    lastRawUserInput = (event.text ?? "").trim();
+  });
+
   pi.on("before_agent_start", async (event: any) => {
     if (initializing) await initializing;
     const recallMode = getRecallMode();
@@ -163,14 +169,20 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     turnCount += 1;
     recallInjectedForCurrentAgent = false;
     pendingRecallIndicator = null;
-    const rawPrompt = (event.prompt ?? "").trim();
+    const expandedPrompt = (event.prompt ?? "").trim();
+    const capturedRawPrompt = lastRawUserInput;
+    lastRawUserInput = null;
+    const rawPrompt = (capturedRawPrompt ?? expandedPrompt).trim();
+    const isSlashCommandLike = rawPrompt.startsWith("/");
     const forceRecallForInspection = SHOULD_FORCE_RECALL_RE.test(rawPrompt);
     const isContinuePrompt = CONTINUE_RE.test(rawPrompt);
-    const derivedRecallQuery = forceRecallForInspection
-      ? (lastMeaningfulRecallQuery ?? FALLBACK_RECALL_QUERY)
-      : isContinuePrompt && lastMeaningfulRecallQuery
-        ? lastMeaningfulRecallQuery
-        : rawPrompt;
+    const derivedRecallQuery = isSlashCommandLike
+      ? null
+      : forceRecallForInspection
+        ? (lastMeaningfulRecallQuery ?? FALLBACK_RECALL_QUERY)
+        : isContinuePrompt && lastMeaningfulRecallQuery
+          ? lastMeaningfulRecallQuery
+          : rawPrompt;
     const shouldSkipAutoRecall = !forceRecallForInspection
       && handles.config.injectionFrequency === "first-turn"
       && turnCount > 1
@@ -180,6 +192,11 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
       pendingRecallConfig = null;
       pendingInspectionHint = "";
       pendingToolHint = "";
+      setHookStat("recall", {
+        firedAt: new Date().toISOString(),
+        result: "skipped",
+        detail: isSlashCommandLike ? "slash-command" : shouldSkipAutoRecall ? "continue-first-turn" : "empty-query",
+      });
       return;
     }
 
@@ -212,13 +229,20 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
       const recallDurationMs = Date.now() - recallStartedAt;
       const memory = renderCachedContext();
       if (!memory) {
-        setHookStat("recall", { firedAt: new Date().toISOString(), result: "skipped", detail: "empty" });
+        setHookStat("recall", { firedAt: new Date().toISOString(), result: "skipped", detail: "empty-or-too-long" });
         recallInjectedForCurrentAgent = true;
         pendingRecallQuery = null;
         pendingRecallConfig = null;
         pendingInspectionHint = "";
         pendingToolHint = "";
         pendingRecallIndicator = null;
+        const reason = getLastRecallErrorReason();
+        currentUi?.notify(
+          reason === "query-too-long"
+            ? "🧠 Hindsight recall skipped: query exceeds Hindsight limit. Shorten prompt or change settings."
+            : "🧠 Hindsight recall skipped for this turn (no results or recall failed).",
+          "warning",
+        );
         return;
       }
 
