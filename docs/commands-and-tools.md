@@ -232,3 +232,15 @@ Why no direct `profile` analog in MVP:
 Implemented:
 - tools: `hindsight_search`, `hindsight_context`, `hindsight_retain`, `hindsight_bank_profile`
 - commands: `/hindsight:setup`, `/hindsight:status`, `/hindsight:config`, `/hindsight:doctor`, `/hindsight:mode`, `/hindsight:sync`, `/hindsight:map`, `/hindsight:recall`, `/hindsight:retain`, `/hindsight:settings`
+
+## v3 Commands
+
+- `/hindsight:popup` — show exact last recall payload from extension-owned state.
+- `/hindsight:flush` — flush current session queue with retainBatch append payloads.
+- `/hindsight:profile broad|project|cwd|global|isolated` — apply a v3 memory routing preset.
+- `/hindsight:toggle-retain` — toggle automatic retention for the current session.
+- `/hindsight:tag <tag>` — add a session tag included on flush.
+- `/hindsight:remove-tag <tag>` — remove a session tag.
+- `/hindsight:parse-session` — parse current session to JSON for inspection.
+- `/hindsight:parse-and-upsert-session` — upsert current session as one stable Hindsight document.
+- `/hindsight:prune-recall-messages confirm` — remove persisted `hindsight-recall` entries from the current session file.

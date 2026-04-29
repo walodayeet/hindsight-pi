@@ -218,3 +218,32 @@ Not in required MVP config:
 - per-tool budgets beyond search/reflect defaults
 - mental model declarative config
 - migration from Honcho config automatically
+
+## v3 Additions
+
+```jsonc
+{
+  "host": {
+    "pi": {
+      "recallMaxQueryChars": 800,
+      "recallLongQueryBehavior": "skip",
+      "autoRecallPersist": false,
+      "autoRecallDisplay": false,
+      "constantTags": ["harness:pi"],
+      "autoRecallTags": ["{project}"],
+      "autoRecallTagsMatch": "any_strict",
+      "projectName": "stable-project-name",
+      "observationScopes": [["{project}"]],
+      "retainContent": { "assistant": ["text"], "user": ["text"], "toolResult": [] },
+      "strip": { "topLevel": ["type", "id", "parentId"], "message": ["api", "provider", "model", "usage", "cost", "stopReason", "timestamp", "responseId"] },
+      "toolFilter": { "toolCall": { "exclude": ["hindsight_retain", "hindsight_recall", "hindsight_reflect"] }, "toolResult": { "exclude": ["hindsight_retain", "hindsight_recall", "hindsight_reflect"] } }
+    }
+  }
+}
+```
+
+`recallLongQueryBehavior: "skip"` is the default so oversized prompts warn and do not call Hindsight. Set it to `"truncate"` only if you prefer best-effort recall.
+
+`autoRecallTags` supports `{session}`, `{parent}`, `{cwd}`, `{basedir}`, and `{project}` placeholders. Use `{project}` with `projectName` for recall that survives directory moves.
+
+Use one bank plus tags/scopes for normal project separation. Use separate banks only for hard boundaries such as work/personal/client isolation.

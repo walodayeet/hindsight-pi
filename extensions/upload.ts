@@ -219,21 +219,18 @@ export class WriteScheduler {
   ) {}
 
   private async sendWithRetry(handles: HindsightHandles, bankId: string, items: RetainItem[]): Promise<void> {
+    const batchItems = items.map((item) => ({
+      content: item.content,
+      context: item.context,
+      metadata: item.metadata,
+      tags: item.tags,
+      timestamp: item.timestamp,
+    }));
     try {
-      if (items.length === 1) {
-        const [item] = items;
-        await handles.client.retain(bankId, item.content, item);
-      } else {
-        await handles.client.retainBatch(bankId, items, { async: false });
-      }
+      await handles.client.retainBatch(bankId, batchItems, { async: false });
     } catch (firstError) {
       await new Promise((r) => setTimeout(r, 1500));
-      if (items.length === 1) {
-        const [item] = items;
-        await handles.client.retain(bankId, item.content, item);
-      } else {
-        await handles.client.retainBatch(bankId, items, { async: false });
-      }
+      await handles.client.retainBatch(bankId, batchItems, { async: false });
       if (handles.config.logging) {
         console.warn("[hindsight-pi] upload retried after error:", firstError instanceof Error ? firstError.message : firstError);
       }

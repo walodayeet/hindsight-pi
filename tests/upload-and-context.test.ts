@@ -91,6 +91,36 @@ describe("context helpers", () => {
     expect(formatLastRecallInspection()).not.toContain("Visible recall state");
   });
 
+  it("passes auto recall tags and tag match to recall", async () => {
+    clearCachedContext();
+    const seen: any[] = [];
+    const handles = {
+      bankId: "bank-1",
+      config: {
+        workspace: "pi",
+        searchBudget: "mid",
+        contextTokens: 512,
+        logging: false,
+        globalBankId: undefined,
+        autoRecallTags: ["{project}"],
+        autoRecallTagsMatch: "any_strict",
+        projectName: "hindsight-pi",
+      },
+      linked: [],
+      client: {
+        recall: async (_bankId: string, _query: string, options: any) => {
+          seen.push(options);
+          return { results: [{ text: "Project-specific fact", type: "observation" }] };
+        },
+      },
+    } as any;
+
+    await refreshContextForPrompt(handles, "project query", { cwd: "/tmp/elsewhere", sessionId: "s1" });
+
+    expect(seen[0].tags).toEqual(["project:hindsight-pi"]);
+    expect(seen[0].tagsMatch).toBe("any_strict");
+  });
+
   it("skips gracefully when recall query is too long", async () => {
     clearCachedContext();
     const seen: string[] = [];

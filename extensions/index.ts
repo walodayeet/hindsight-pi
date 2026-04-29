@@ -6,8 +6,17 @@ import { getRecallMode, resolveConfig } from "./config.js";
 import { clearCachedContext, countCachedContext, getLastRecallErrorReason, previewCachedContext, refreshContextForPrompt, renderCachedContext } from "./context.js";
 import { registerTools } from "./tools.js";
 import { WriteScheduler } from "./upload.js";
+import { recordFlushFailure, recordFlushSuccess } from "./flush-state.js";
 import { resetHookStats, setHookStat } from "./hooks.js";
+import { sessionRetained, sessionTags } from "./meta.js";
+import { filterHindsightProviderMessages, HINDSIGHT_RECALL_STATUS_TYPE, HINDSIGHT_RETAIN_STATUS_TYPE } from "./provider-filter.js";
+import { createRecallCustomMessage, HINDSIGHT_RECALL_CUSTOM_TYPE } from "./recall-message.js";
+import { deriveRecallQuery, isContinuePrompt } from "./recall-query.js";
+import { appendQueueRecord, deleteQueue, readQueueRecords } from "./queue.js";
+import { prepareRetainEntry } from "./retain/prepare.js";
+import { buildAutomaticTags, expandObservationScopes } from "./retain/tags.js";
 import { deriveWorkspaceSessionName } from "./session.js";
+import { getParentSessionId, getSessionContext, getSessionDocumentId, getSessionStartTimestamp } from "./session-document.js";
 
 const setStatus = (ctx: { ui: { setStatus(id: string, text: string): void } }, state: "off" | "connecting" | "recalling" | "connected" | "syncing" | "offline") => {
   const labels: Record<typeof state, string> = {
@@ -21,11 +30,9 @@ const setStatus = (ctx: { ui: { setStatus(id: string, text: string): void } }, s
   ctx.ui.setStatus("hindsight", labels[state]);
 };
 
-const RETAIN_MESSAGE_TYPE = "hindsight-retain-status";
-const RECALL_MESSAGE_TYPE = "hindsight-recall-status";
-const SHOULD_FORCE_RECALL_RE = /\b(what memory|what do you remember|what was recalled|what got recalled|what was loaded|what got loaded|what memories|memory do you have|what do you have in your context|what is in your context)\b/i;
-const CONTINUE_RE = /^(continue|go on|keep going|next|proceed)$/i;
-const FALLBACK_RECALL_QUERY = "Current durable user preferences, stable repo facts, active project goals, and important coding constraints for this workspace.";
+const RETAIN_MESSAGE_TYPE = HINDSIGHT_RETAIN_STATUS_TYPE;
+const RECALL_MESSAGE_TYPE = HINDSIGHT_RECALL_STATUS_TYPE;
+const RECALL_CONTEXT_TYPE = HINDSIGHT_RECALL_CUSTOM_TYPE;
 
 export default function hindsightMemory(pi: ExtensionAPI): void {
   let initializing: Promise<void> | null = null;
@@ -46,17 +53,11 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
   const emitIndicator = (config: any, type: string, content: string, details: Record<string, unknown> = {}): void => {
     if ((type === RECALL_MESSAGE_TYPE && !config.showRecallIndicator) || (type === RETAIN_MESSAGE_TYPE && !config.showRetainIndicator)) return;
 
-    if (!config.indicatorsInContext && currentUi) {
-      currentUi.notify(content, type === RETAIN_MESSAGE_TYPE ? "success" : "info");
-      return;
-    }
-
-    pi.sendMessage({
-      customType: type,
-      content,
-      display: true,
-      details,
-    }, { triggerTurn: false });
+    // Status indicators are UI only. Custom messages are serialized as user
+    // messages by pi, so using pi.sendMessage here bloats provider context and
+    // can make the agent see banners like "memory context loaded" instead of
+    // the actual hidden recall payload.
+    currentUi?.notify(content, type === RETAIN_MESSAGE_TYPE ? "success" : "info");
   };
 
   const compactSnippet = (value: string, maxLine = 100): string => {
@@ -67,16 +68,23 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     return `${first}${first.length < normalized.length ? "…" : ""}${second ? `\n  ${second}${normalized.length > maxLine * 2 ? "…" : ""}` : ""}`;
   };
 
-  pi.registerMessageRenderer(RECALL_MESSAGE_TYPE, (message: any, options: any, theme: any) => {
-    const details = (message.details ?? {}) as { bankId?: string; previews?: string[]; chars?: number; resultCount?: number };
+  const renderRecallBox = (message: any, options: any, theme: any) => {
+    const details = (message.details ?? {}) as { bankId?: string; previews?: string[]; chars?: number; resultCount?: number; query?: string };
     const count = details.resultCount ?? details.previews?.length ?? 0;
     const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
     let text = `${theme.fg("accent", "🧠 HINDSIGHT RECALL")} ${theme.fg("muted", details.bankId ?? "")}`.trim();
     text += `\n${theme.fg("accent", `Loaded ${count} memory snippet${count === 1 ? "" : "s"}`)}`;
+    if (options.expanded && details.query) text += `\n${theme.fg("dim", `query: ${compactSnippet(details.query, 120)}`)}`;
     if (options.expanded && details.previews?.length) text += `\n${details.previews.map((line) => `• ${compactSnippet(line)}`).join("\n")}`;
     if (options.expanded && details.chars) text += `\n${theme.fg("dim", `${details.chars} chars injected`)}`;
     box.addChild(new Text(text, 0, 0));
     return box;
+  };
+
+  pi.registerMessageRenderer(RECALL_MESSAGE_TYPE, renderRecallBox);
+  pi.registerMessageRenderer(RECALL_CONTEXT_TYPE, (message: any, options: any, theme: any) => {
+    if (message.display === false) return undefined;
+    return renderRecallBox(message, options, theme);
   });
   pi.registerMessageRenderer(RETAIN_MESSAGE_TYPE, (message: any, _options: any, theme: any) => {
     const details = (message.details ?? {}) as { mode?: string; bankId?: string; itemsCount?: number; queueStatus?: string };
@@ -88,6 +96,12 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     if (!saved && details.queueStatus) text += `\n${theme.fg("dim", details.queueStatus)}`;
     box.addChild(new Text(text, 0, 0));
     return box;
+  });
+
+  pi.on("context", async (event: any) => {
+    const messages = Array.isArray(event.messages) ? event.messages : [];
+    const filtered = filterHindsightProviderMessages(messages);
+    if (filtered.length !== messages.length) return { messages: filtered };
   });
 
   registerTools(pi);
@@ -172,39 +186,43 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     const expandedPrompt = (event.prompt ?? "").trim();
     const capturedRawPrompt = lastRawUserInput;
     lastRawUserInput = null;
-    const rawPrompt = (capturedRawPrompt ?? expandedPrompt).trim();
-    const isSlashCommandLike = rawPrompt.startsWith("/");
-    const forceRecallForInspection = SHOULD_FORCE_RECALL_RE.test(rawPrompt);
-    const isContinuePrompt = CONTINUE_RE.test(rawPrompt);
-    const derivedRecallQuery = isSlashCommandLike
-      ? null
-      : forceRecallForInspection
-        ? (lastMeaningfulRecallQuery ?? FALLBACK_RECALL_QUERY)
-        : isContinuePrompt && lastMeaningfulRecallQuery
-          ? lastMeaningfulRecallQuery
-          : rawPrompt;
-    const shouldSkipAutoRecall = !forceRecallForInspection
+    const rawPrompt = (capturedRawPrompt ?? "").trim();
+    const basePrompt = rawPrompt || expandedPrompt;
+    const continuePrompt = isContinuePrompt(basePrompt);
+    const decision = deriveRecallQuery({
+      rawInput: continuePrompt && lastMeaningfulRecallQuery ? lastMeaningfulRecallQuery : capturedRawPrompt,
+      expandedPrompt: continuePrompt && lastMeaningfulRecallQuery ? lastMeaningfulRecallQuery : expandedPrompt,
+      lastMeaningfulPrompt: lastMeaningfulRecallQuery,
+      maxChars: handles.config.recallMaxQueryChars,
+      longQueryBehavior: handles.config.recallLongQueryBehavior,
+    });
+    const shouldSkipAutoRecall = decision.kind === "query"
+      && !decision.forceInspection
       && handles.config.injectionFrequency === "first-turn"
       && turnCount > 1
-      && isContinuePrompt;
-    if (shouldSkipAutoRecall || !derivedRecallQuery) {
+      && continuePrompt;
+    if (shouldSkipAutoRecall || decision.kind === "skip") {
       pendingRecallQuery = null;
       pendingRecallConfig = null;
       pendingInspectionHint = "";
       pendingToolHint = "";
+      const detail = shouldSkipAutoRecall ? "continue-first-turn" : decision.kind === "skip" ? decision.reason : "empty-query";
       setHookStat("recall", {
         firedAt: new Date().toISOString(),
         result: "skipped",
-        detail: isSlashCommandLike ? "slash-command" : shouldSkipAutoRecall ? "continue-first-turn" : "empty-query",
+        detail,
       });
+      if (detail === "query-too-long") {
+        currentUi?.notify(`🧠 Hindsight recall skipped: query exceeds ${handles.config.recallMaxQueryChars} characters. Shorten prompt or set recallLongQueryBehavior=truncate.`, "warning");
+      }
       return;
     }
 
     lastContextTurn = turnCount;
-    if (!forceRecallForInspection && rawPrompt) lastMeaningfulRecallQuery = rawPrompt;
-    pendingRecallQuery = derivedRecallQuery;
+    if (!decision.forceInspection && decision.query) lastMeaningfulRecallQuery = decision.query;
+    pendingRecallQuery = decision.query;
     pendingRecallConfig = handles.config;
-    pendingInspectionHint = forceRecallForInspection
+    pendingInspectionHint = decision.forceInspection
       ? "\n\nIf the user asks what memory is loaded or what is in current context, answer from the loaded <hindsight_memories> block directly. Do not say no memory was loaded if the block is present."
       : "";
     pendingToolHint = recallMode === "hybrid"
@@ -217,15 +235,20 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
   });
 
   pi.on("context", async (event: any, ctx: any) => {
+    const inputMessages = Array.isArray(event.messages) ? event.messages : [];
+    const filteredMessages = filterHindsightProviderMessages(inputMessages);
     const handles = getHandles();
-    if (!handles || !pendingRecallQuery || recallInjectedForCurrentAgent) return;
+    if (!handles || !pendingRecallQuery || recallInjectedForCurrentAgent) {
+      if (filteredMessages.length !== inputMessages.length) return { messages: filteredMessages };
+      return;
+    }
 
     setStatus(ctx, "recalling");
     currentUi?.notify("🧠 Hindsight recalling…", "info");
 
     try {
       const recallStartedAt = Date.now();
-      await refreshContextForPrompt(handles, pendingRecallQuery);
+      await refreshContextForPrompt(handles, pendingRecallQuery, { cwd: ctx.cwd, sessionId: getSessionDocumentId(ctx), parentId: getParentSessionId(ctx) });
       const recallDurationMs = Date.now() - recallStartedAt;
       const memory = renderCachedContext();
       if (!memory) {
@@ -262,88 +285,99 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
           durationMs: recallDurationMs,
         },
       };
-      const contextMessage = {
-        role: "custom",
-        customType: "hindsight-context",
+      const contextMessage = createRecallCustomMessage({
         content: `${memory}${pendingInspectionHint}${pendingToolHint}`,
         display: false,
         details: {
           bankId: handles.bankId,
           query: pendingRecallQuery,
         },
-        timestamp: Date.now(),
-      };
+      });
       pendingRecallQuery = null;
       pendingRecallConfig = null;
       pendingInspectionHint = "";
       pendingToolHint = "";
+      if (handles.config.autoRecallPersist) {
+        pi.sendMessage({
+          customType: RECALL_CONTEXT_TYPE,
+          content: contextMessage.content,
+          display: handles.config.autoRecallDisplay,
+          details: contextMessage.details,
+        }, { triggerTurn: false });
+      }
       emitIndicator(handles.config, RECALL_MESSAGE_TYPE, pendingRecallIndicator.content, pendingRecallIndicator.details);
       pendingRecallIndicator = null;
       return {
-        messages: [...event.messages, contextMessage],
+        messages: [...filteredMessages, contextMessage],
       };
     } finally {
       setStatus(ctx, "connected");
     }
   });
 
-  pi.on("agent_end", async (event: any, ctx: any) => {
+  const flushQueuedSession = async (ctx: any): Promise<void> => {
+    const handles = getHandles();
+    if (!handles) return;
+    const sessionId = getSessionDocumentId(ctx);
+    const { records } = readQueueRecords(sessionId, "auto");
+    if (records.length === 0) return;
+    try {
+      await handles.client.retainBatch(handles.bankId, records.map((record) => ({
+        content: record.content,
+        context: record.context,
+        tags: record.tags,
+        metadata: record.metadata,
+        timestamp: record.timestamp,
+        document_id: record.document_id,
+        update_mode: record.update_mode,
+        observation_scopes: record.observation_scopes,
+      })), { async: false });
+      deleteQueue(sessionId, "auto");
+      recordFlushSuccess();
+    } catch (error) {
+      recordFlushFailure(error);
+      setHookStat("retain", { firedAt: new Date().toISOString(), result: "failed", detail: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  };
+
+  pi.on("message_end", async (event: any, ctx: any) => {
+    const handles = getHandles();
+    if (!handles || !handles.config.saveMessages) return;
+    const sessionId = getSessionDocumentId(ctx);
+    const entries = ctx?.sessionManager?.getEntries?.() ?? [];
+    if (!sessionRetained(entries, true)) return;
+    const message = event?.message;
+    if (!message || message.customType === RECALL_CONTEXT_TYPE || message.customType === RECALL_MESSAGE_TYPE || message.customType === RETAIN_MESSAGE_TYPE) return;
+    const role = message.role;
+    if (role !== "user" && role !== "assistant" && role !== "toolResult") return;
+    const preparedEntry = prepareRetainEntry({ type: "message", message, timestamp: new Date().toISOString() }, handles.config);
+    if (!preparedEntry) return;
+    const content = JSON.stringify(preparedEntry);
+    appendQueueRecord({
+      sessionId,
+      bankId: handles.bankId,
+      content,
+      context: getSessionContext(ctx),
+      tags: [...buildAutomaticTags(handles.config, { cwd: ctx.cwd, sessionId, parentId: getParentSessionId(ctx) }, "auto"), ...sessionTags(entries)],
+      metadata: { source: "pi", kind: "session-message", origin: "auto", workspace: handles.config.workspace },
+      timestamp: getSessionStartTimestamp(ctx),
+      document_id: sessionId,
+      update_mode: "append",
+      observation_scopes: expandObservationScopes(handles.config, { cwd: ctx.cwd, sessionId, parentId: getParentSessionId(ctx) }) ?? undefined,
+    }, "auto");
+    setHookStat("retain", { firedAt: new Date().toISOString(), result: "ok", detail: "queued:message_end" });
+  });
+
+  pi.on("agent_end", async () => {
     recallInjectedForCurrentAgent = false;
     pendingRecallQuery = null;
     pendingRecallConfig = null;
     pendingInspectionHint = "";
     pendingToolHint = "";
-    const handles = getHandles();
-    if (!handles || !handles.config.saveMessages) return;
-    setStatus(ctx, "syncing");
-
-    retainInFlight = retainInFlight.then(async () => {
-      try {
-        const outcome = await scheduler?.onTurnEnd(handles, event.messages as any[]);
-        setStatus(ctx, "connected");
-        if (outcome?.skipped) {
-          setHookStat("retain", { firedAt: new Date().toISOString(), result: "skipped", detail: outcome.reason });
-          return;
-        }
-        if (outcome && !outcome.skipped) {
-          const { summary } = outcome;
-          setHookStat("retain", { firedAt: new Date().toISOString(), result: "ok", detail: `${summary.mode}:${summary.itemsCount}` });
-          const queueStatus = summary.mode !== "queued"
-            ? undefined
-            : handles.config.writeFrequency === "async"
-              ? "waiting for server confirmation"
-              : handles.config.writeFrequency === "session"
-                ? "saved on session end"
-                : typeof handles.config.writeFrequency === "number"
-                  ? `saved on flush after ${handles.config.writeFrequency} queued turn(s)`
-                  : undefined;
-          const retainLabel = summary.mode === "queued"
-            ? handles.config.writeFrequency === "session"
-              ? "⏳ HINDSIGHT RETAIN · queued for session end"
-              : handles.config.writeFrequency === "async"
-                ? "⏳ HINDSIGHT RETAIN · queued for async save"
-                : typeof handles.config.writeFrequency === "number"
-                  ? `⏳ HINDSIGHT RETAIN · queued for ${handles.config.writeFrequency}-turn batch`
-                  : "⏳ HINDSIGHT RETAIN · queued"
-            : "💾 HINDSIGHT RETAIN · memory retained";
-          emitIndicator(handles.config, RETAIN_MESSAGE_TYPE, `${retainLabel}`, {
-            mode: summary.mode,
-            bankId: handles.bankId,
-            itemsCount: summary.itemsCount,
-            previews: summary.previews,
-            ...(queueStatus ? { queueStatus } : {}),
-            ...(summary.mode === "saved" ? { fullText: summary.fullText } : {}),
-          });
-        }
-      } catch (error) {
-        console.error("[hindsight-pi] upload failed:", error instanceof Error ? error.message : error);
-        setHookStat("retain", { firedAt: new Date().toISOString(), result: "failed", detail: error instanceof Error ? error.message : String(error) });
-        setStatus(ctx, "offline");
-      }
-    });
   });
 
-  const flush = async () => { await retainInFlight; await scheduler?.flush(); };
+  const flush = async (_event?: any, ctx?: any) => { await retainInFlight; await scheduler?.flush(); if (ctx) await flushQueuedSession(ctx); };
   pi.on("session_shutdown", flush);
   pi.on("session_before_switch", flush);
   pi.on("session_before_fork", flush);

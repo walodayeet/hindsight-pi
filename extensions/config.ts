@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
+import type { RetainContentConfig, StripConfig, ToolFilterConfig } from "./retain/prepare.js";
 
 export type BankStrategy = "per-directory" | "git-branch" | "pi-session" | "per-repo" | "global" | "manual";
 export type RecallMode = "hybrid" | "context" | "tools" | "off";
@@ -11,6 +12,9 @@ export type ReasoningLevel = "low" | "medium" | "high";
 export type RecallType = "world" | "experience" | "observation";
 export type RetainMode = "response" | "step-batch" | "both" | "off";
 export type RecallDisplayMode = "grouped" | "unified";
+export type RecallLongQueryBehavior = "skip" | "truncate";
+export type AutoRecallTagsMatch = "any" | "all" | "any_strict" | "all_strict";
+export type ObservationScopes = "combined" | "per_tag" | "all_combinations" | string[][] | null;
 
 export interface HostConfig {
   enabled?: boolean;
@@ -44,6 +48,18 @@ export interface HostConfig {
   showRetainIndicator?: boolean;
   indicatorsInContext?: boolean;
   renameSessionToBank?: boolean;
+  recallMaxQueryChars?: number;
+  recallLongQueryBehavior?: RecallLongQueryBehavior;
+  autoRecallPersist?: boolean;
+  autoRecallDisplay?: boolean;
+  constantTags?: string[];
+  autoRecallTags?: string[] | null;
+  autoRecallTagsMatch?: AutoRecallTagsMatch;
+  projectName?: string;
+  observationScopes?: ObservationScopes;
+  retainContent?: RetainContentConfig;
+  strip?: StripConfig;
+  toolFilter?: ToolFilterConfig;
 }
 
 export interface LinkedHostFileConfig {
@@ -125,6 +141,18 @@ export interface HindsightConfig {
   showRetainIndicator: boolean;
   indicatorsInContext: boolean;
   renameSessionToBank: boolean;
+  recallMaxQueryChars: number;
+  recallLongQueryBehavior: RecallLongQueryBehavior;
+  autoRecallPersist: boolean;
+  autoRecallDisplay: boolean;
+  constantTags: string[];
+  autoRecallTags: string[] | null;
+  autoRecallTagsMatch: AutoRecallTagsMatch;
+  projectName?: string;
+  observationScopes: ObservationScopes;
+  retainContent: RetainContentConfig;
+  strip: StripConfig;
+  toolFilter: ToolFilterConfig;
   mappings: Record<string, string>;
 }
 
@@ -151,6 +179,17 @@ const intOr = (value: unknown, fallback: number): number => {
 const boolOr = (value: unknown, fallback: boolean): boolean => {
   if (typeof value === "boolean") return value;
   if (typeof value === "string") return value === "true";
+  return fallback;
+};
+
+const jsonOr = <T>(value: unknown, fallback: T): T => {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (Array.isArray(value) || typeof value === "object") return value as T;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return value as T;
+    try { return JSON.parse(trimmed) as T; } catch { return fallback; }
+  }
   return fallback;
 };
 
@@ -202,6 +241,17 @@ export const normalizeRecallMode = (value: unknown): RecallMode => {
 
 const normalizeInjectionFrequency = (value: unknown): InjectionFrequency => value === "every-turn" ? "every-turn" : "first-turn";
 const normalizeRecallDisplayMode = (value: unknown): RecallDisplayMode => value === "unified" ? "unified" : "grouped";
+const normalizeRecallLongQueryBehavior = (value: unknown): RecallLongQueryBehavior => value === "truncate" ? "truncate" : "skip";
+const normalizeAutoRecallTagsMatch = (value: unknown): AutoRecallTagsMatch => {
+  switch (value) {
+    case "all":
+    case "any_strict":
+    case "all_strict":
+      return value;
+    default:
+      return "any";
+  }
+};
 
 const normalizeRetainMode = (value: unknown): RetainMode => {
   switch (value) {
@@ -422,6 +472,18 @@ export const resolveConfig = async (cwd?: string): Promise<HindsightConfig> => {
     showRetainIndicator: boolOr(process.env.HINDSIGHT_SHOW_RETAIN_INDICATOR ?? host.showRetainIndicator, true),
     indicatorsInContext: boolOr(process.env.HINDSIGHT_INDICATORS_IN_CONTEXT ?? host.indicatorsInContext, false),
     renameSessionToBank: boolOr(process.env.HINDSIGHT_RENAME_SESSION_TO_BANK ?? host.renameSessionToBank, false),
+    recallMaxQueryChars: intOr(process.env.HINDSIGHT_RECALL_MAX_QUERY_CHARS ?? host.recallMaxQueryChars, 800),
+    recallLongQueryBehavior: normalizeRecallLongQueryBehavior(process.env.HINDSIGHT_RECALL_LONG_QUERY_BEHAVIOR ?? host.recallLongQueryBehavior),
+    autoRecallPersist: boolOr(process.env.HINDSIGHT_AUTO_RECALL_PERSIST ?? host.autoRecallPersist, false),
+    autoRecallDisplay: boolOr(process.env.HINDSIGHT_AUTO_RECALL_DISPLAY ?? host.autoRecallDisplay, false),
+    constantTags: csvOr(process.env.HINDSIGHT_CONSTANT_TAGS ?? host.constantTags, ["harness:pi"]),
+    autoRecallTags: (process.env.HINDSIGHT_AUTO_RECALL_TAGS ?? host.autoRecallTags) == null ? null : csvOr(process.env.HINDSIGHT_AUTO_RECALL_TAGS ?? host.autoRecallTags, []),
+    autoRecallTagsMatch: normalizeAutoRecallTagsMatch(process.env.HINDSIGHT_AUTO_RECALL_TAGS_MATCH ?? host.autoRecallTagsMatch),
+    projectName: (process.env.HINDSIGHT_PROJECT_NAME ?? host.projectName) || undefined,
+    observationScopes: jsonOr<ObservationScopes>(process.env.HINDSIGHT_OBSERVATION_SCOPES ?? host.observationScopes, null),
+    retainContent: jsonOr<any>(process.env.HINDSIGHT_RETAIN_CONTENT ?? host.retainContent, { assistant: ["text"], user: ["text"], toolResult: [] }),
+    strip: jsonOr<any>(process.env.HINDSIGHT_STRIP ?? host.strip, { topLevel: ["type", "id", "parentId"], message: ["api", "provider", "model", "usage", "cost", "stopReason", "timestamp", "responseId"] }),
+    toolFilter: jsonOr<any>(process.env.HINDSIGHT_TOOL_FILTER ?? host.toolFilter, { toolCall: { exclude: ["grep", "find", "ls", "read", "hindsight_retain", "hindsight_recall", "hindsight_reflect"] }, toolResult: { exclude: ["grep", "find", "ls", "write", "edit", "hindsight_retain", "hindsight_recall", "hindsight_reflect"] } }),
     mappings: file?.mappings ?? {},
   };
 
@@ -466,6 +528,18 @@ export const saveConfig = async (input: {
   showRetainIndicator?: boolean;
   indicatorsInContext?: boolean;
   renameSessionToBank?: boolean;
+  recallMaxQueryChars?: number;
+  recallLongQueryBehavior?: RecallLongQueryBehavior;
+  autoRecallPersist?: boolean;
+  autoRecallDisplay?: boolean;
+  constantTags?: string[];
+  autoRecallTags?: string[] | null;
+  autoRecallTagsMatch?: AutoRecallTagsMatch;
+  projectName?: string;
+  observationScopes?: ObservationScopes;
+  retainContent?: RetainContentConfig;
+  strip?: StripConfig;
+  toolFilter?: ToolFilterConfig;
   mappings?: Record<string, string>;
 }, options?: { cwd?: string; scope?: "global" | "project" }): Promise<void> => {
   const scope = options?.scope ?? "global";
@@ -533,6 +607,18 @@ export const saveConfig = async (input: {
         stepRetainThreshold: input.stepRetainThreshold ?? current.host?.pi?.stepRetainThreshold,
         toolPreviewLength: input.toolPreviewLength ?? current.host?.pi?.toolPreviewLength,
         maxMessageLength: input.maxMessageLength ?? current.host?.pi?.maxMessageLength,
+        recallMaxQueryChars: input.recallMaxQueryChars ?? current.host?.pi?.recallMaxQueryChars,
+        recallLongQueryBehavior: input.recallLongQueryBehavior ?? current.host?.pi?.recallLongQueryBehavior,
+        autoRecallPersist: input.autoRecallPersist ?? current.host?.pi?.autoRecallPersist,
+        autoRecallDisplay: input.autoRecallDisplay ?? current.host?.pi?.autoRecallDisplay,
+        constantTags: input.constantTags ?? current.host?.pi?.constantTags,
+        autoRecallTags: input.autoRecallTags === null ? null : input.autoRecallTags ?? current.host?.pi?.autoRecallTags,
+        autoRecallTagsMatch: input.autoRecallTagsMatch ?? current.host?.pi?.autoRecallTagsMatch,
+        projectName: input.projectName ?? current.host?.pi?.projectName,
+        observationScopes: input.observationScopes ?? current.host?.pi?.observationScopes,
+        retainContent: input.retainContent ?? current.host?.pi?.retainContent,
+        strip: input.strip ?? current.host?.pi?.strip,
+        toolFilter: input.toolFilter ?? current.host?.pi?.toolFilter,
       },
     },
   };

@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { ensureBank, getBankInsights, getHandles, type HindsightHandles } from "./client.js";
 import { getRecallMode, type ReasoningLevel, type SearchBudget } from "./config.js";
+import { sessionRetained } from "./meta.js";
 
 const sanitizeTag = (value: string): string => value.toLowerCase().replace(/[^a-z0-9:_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
 
@@ -157,7 +158,12 @@ export const registerTools = (pi: ExtensionAPI): void => {
     }),
     async execute(_toolCallId: string, params: any) {
       const handles = await ensureHandles();
-      await handles.client.retain(handles.bankId, params.content, {
+      const maybeEntries = (params.__sessionEntries ?? undefined) as any[] | undefined;
+      if (maybeEntries && !sessionRetained(maybeEntries, true)) {
+        return { content: [{ type: "text", text: "Hindsight retention is disabled for this session." }], details: { refused: true } };
+      }
+      await handles.client.retainBatch(handles.bankId, [{
+        content: params.content,
         context: params.context,
         metadata: {
           source: "pi",
@@ -175,7 +181,7 @@ export const registerTools = (pi: ExtensionAPI): void => {
           "kind:explicit",
           "origin:explicit",
         ],
-      });
+      }], { async: false });
       return {
         content: [{ type: "text", text: `Saved durable memory to ${handles.bankId}.` }],
         details: {},

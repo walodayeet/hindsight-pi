@@ -1,4 +1,5 @@
 import type { HindsightHandles } from "./client.js";
+import { expandTagPlaceholders } from "./retain/tags.js";
 
 export interface RecallResultSnapshot {
   text: string;
@@ -105,7 +106,7 @@ const isQueryTooLongError = (error: unknown): boolean => {
   return /query too long|exceeds maximum of 500/i.test(message);
 };
 
-export const refreshContextForPrompt = async (handles: HindsightHandles, prompt: string): Promise<void> => {
+export const refreshContextForPrompt = async (handles: HindsightHandles, prompt: string, recallContext?: { cwd: string; sessionId?: string; parentId?: string }): Promise<void> => {
   const trimmedPrompt = normalizeRecallQuery(prompt);
   if (!trimmedPrompt) {
     lastRecallState = EMPTY;
@@ -113,12 +114,16 @@ export const refreshContextForPrompt = async (handles: HindsightHandles, prompt:
   }
 
   const results: RecallResultSnapshot[] = [];
+  const autoRecallTags = recallContext
+    ? expandTagPlaceholders(handles.config.autoRecallTags, handles.config, recallContext)
+    : undefined;
 
   try {
     for (const bankId of uniqueBankIds(handles)) {
       const recall = await handles.client.recall(bankId, trimmedPrompt, {
         budget: handles.config.searchBudget,
         maxTokens: Math.max(handles.config.contextTokens, 512),
+        ...(autoRecallTags ? { tags: autoRecallTags, tagsMatch: handles.config.autoRecallTagsMatch } : {}),
       });
       const sourceLabel = bankId === handles.bankId ? handles.config.workspace : `${handles.config.workspace}:global`;
       results.push(...(recall?.results ?? [])
@@ -141,6 +146,7 @@ export const refreshContextForPrompt = async (handles: HindsightHandles, prompt:
       const recall = await linked.client.recall(linked.bankId, trimmedPrompt, {
         budget: handles.config.searchBudget,
         maxTokens: Math.max(handles.config.contextTokens, 512),
+        ...(autoRecallTags ? { tags: autoRecallTags, tagsMatch: handles.config.autoRecallTagsMatch } : {}),
       });
       results.push(...(recall?.results ?? [])
         .map((entry: any) => normalizeRecallEntry(entry, linked.name))

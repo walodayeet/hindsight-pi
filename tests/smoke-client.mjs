@@ -16,10 +16,16 @@ try {
     await client.createBank(bankId, { name: bankId, background: 'Smoke test bank for hindsight-pi' });
   }
 
-  await client.retain(bankId, 'Smoke test memory from hindsight-pi extension scaffold.', {
+  await client.retainBatch(bankId, [{
+    content: 'Smoke test memory from hindsight-pi extension scaffold.',
     context: 'manual smoke test',
     metadata: { source: 'hindsight-pi-smoke' },
-  });
+    tags: ['harness:pi', 'smoke:test'],
+    observation_scopes: [['harness:pi']],
+    document_id: 'hindsight-pi-smoke-session',
+    update_mode: 'append',
+    timestamp: new Date().toISOString(),
+  }], { async: false });
 
   const result = await client.recall(bankId, 'smoke test memory', { budget: 'low', maxTokens: 256 });
   console.log(JSON.stringify({ ok: true, baseUrl, bankId, resultCount: result?.results?.length ?? 0 }, null, 2));

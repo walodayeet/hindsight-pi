@@ -1,3 +1,5 @@
+import { readdir, readFile } from "node:fs/promises";
+import { join, basename } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { bootstrap, clearHandles, ensureBank, getBankInsights, getHandles } from "./client.js";
 import { clearCachedContext, formatLastRecallInspection, renderCachedContext } from "./context.js";
@@ -16,8 +18,13 @@ import {
   saveConfig,
   setRecallMode,
 } from "./config.js";
+import { getFlushState, recordFlushFailure, recordFlushSuccess } from "./flush-state.js";
 import { deriveBankId } from "./session.js";
+import { getSessionDocumentId, parseCurrentSessionEntries } from "./session-document.js";
 import { getHookStats } from "./hooks.js";
+import { HINDSIGHT_META_TYPE, getHindsightMeta, nextMeta } from "./meta.js";
+import { pruneRecallMessagesInSessionFile } from "./prune.js";
+import { deleteQueue, readQueueRecords } from "./queue.js";
 
 const mask = (value?: string): string => (value ? `${value.slice(0, 6)}...redacted` : "(none)");
 const parseCsv = (value: string | undefined): string[] => (value ?? "").split(",").map((v) => v.trim()).filter(Boolean);
@@ -470,6 +477,9 @@ const statusText = async (ctx: ExtensionContext): Promise<string> => {
     ? `skepticism=${insights.profile.disposition.skepticism ?? "?"}, literalism=${insights.profile.disposition.literalism ?? "?"}, empathy=${insights.profile.disposition.empathy ?? "?"}`
     : "none";
 
+  const meta = getHindsightMeta(ctx.sessionManager.getEntries?.() ?? []);
+  const queue = readQueueRecords(getSessionDocumentId(ctx), "auto");
+  const flushState = getFlushState();
   const hooks = getHookStats();
   const hookText = (name: keyof typeof hooks): string => {
     const hook = hooks[name];
@@ -499,6 +509,11 @@ const statusText = async (ctx: ExtensionContext): Promise<string> => {
     `Reasoning cap: ${config.reasoningLevelCap ?? "(none)"}`,
     `Write frequency: ${config.writeFrequency}`,
     `Retain mode: ${config.retainMode}`,
+    `Session retain: ${(meta?.retained ?? true) ? "enabled" : "disabled"}`,
+    `Session tags: ${meta?.tags?.length ? meta.tags.join(", ") : "(none)"}`,
+    `Queue: ${queue.records.length} auto record(s), ${queue.malformed} malformed`,
+    `Last flush: ${flushState.lastFlushAt ?? "never"}`,
+    `Last flush error: ${flushState.lastFlushError ?? "none"}`,
     `Step retain threshold: ${config.stepRetainThreshold}`,
     `Auto-create bank: ${config.autoCreateBank ? "yes" : "no"}`,
     `Injection: ${config.injectionFrequency}`,
@@ -508,6 +523,9 @@ const statusText = async (ctx: ExtensionContext): Promise<string> => {
     `Max message length: ${config.maxMessageLength}`,
     `Save messages: ${config.saveMessages ? "yes" : "no"}`,
     `Recall indicator: ${config.showRecallIndicator ? (config.indicatorsInContext ? "in-context" : "ui-only") : "off"}`,
+    `Recall tags: ${config.autoRecallTags?.length ? config.autoRecallTags.join(", ") : "(broad)"}`,
+    `Recall tag match: ${config.autoRecallTagsMatch}`,
+    `Observation scopes: ${config.observationScopes ? JSON.stringify(config.observationScopes) : "(default)"}`,
     `Retain indicator: ${config.showRetainIndicator ? (config.indicatorsInContext ? "in-context" : "ui-only") : "off"}`,
     `Hook session_start: ${hookText("sessionStart")}`,
     `Hook recall: ${hookText("recall")}`,
@@ -595,6 +613,17 @@ export const registerCommands = (pi: ExtensionAPI): void => {
       checks.push(`memory_query_mode: recall`);
       checks.push(`reasoning_level: ${config.reasoningLevel}`);
       checks.push(`reflect_dynamic_budget: ${config.dialecticDynamic ? "on" : "off"}`);
+      checks.push(`auto_recall_tags: ${config.autoRecallTags?.length ? config.autoRecallTags.join(", ") : "broad"}`);
+      checks.push(`auto_recall_tags_match: ${config.autoRecallTagsMatch}`);
+      checks.push(`observation_scopes: ${config.observationScopes ? JSON.stringify(config.observationScopes) : "default"}`);
+      if (config.autoRecallTags?.length && config.observationScopes && Array.isArray(config.observationScopes)) {
+        const flatScopes = new Set(config.observationScopes.flat());
+        const missing = config.autoRecallTags.filter((tag) => tag.startsWith("{") && !flatScopes.has(tag));
+        if (missing.length > 0) checks.push(`warning: recall tag placeholder(s) not present in observationScopes: ${missing.join(", ")}`);
+      }
+      if (config.autoRecallTagsMatch.endsWith("strict") && !config.autoRecallTags?.length) {
+        checks.push("warning: strict tag matching has no effect without autoRecallTags");
+      }
 
       if (!config.enabled) {
         updateStatusBar(ctx, "off");
@@ -677,6 +706,212 @@ export const registerCommands = (pi: ExtensionAPI): void => {
     description: "Show the exact last Hindsight recall result set loaded for inspection",
     handler: async (_args: string, ctx: ExtensionContext) => {
       ctx.ui.notify(formatLastRecallInspection(), "info");
+    },
+  });
+
+  pi.registerCommand("hindsight:popup", {
+    description: "Show the exact last Hindsight recall result set loaded for inspection",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      ctx.ui.notify(formatLastRecallInspection(), "info");
+    },
+  });
+
+  pi.registerCommand("hindsight:flush", {
+    description: "Flush queued Hindsight retain records for the current session",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      const handles = getHandles();
+      if (!handles) {
+        ctx.ui.notify("Hindsight is not connected. Run /hindsight:setup first.", "warning");
+        return;
+      }
+      const sessionId = getSessionDocumentId(ctx);
+      const { records, malformed } = readQueueRecords(sessionId, "auto");
+      if (records.length === 0) {
+        ctx.ui.notify(malformed ? `No valid queued records (${malformed} malformed line(s) ignored).` : "No queued Hindsight records for this session.", "info");
+        return;
+      }
+      try {
+        await handles.client.retainBatch(handles.bankId, records.map((record) => ({
+          content: record.content,
+          context: record.context,
+          tags: record.tags,
+          metadata: record.metadata,
+          timestamp: record.timestamp,
+          document_id: record.document_id,
+          update_mode: record.update_mode,
+          observation_scopes: record.observation_scopes,
+        })), { async: false });
+        deleteQueue(sessionId, "auto");
+        recordFlushSuccess();
+        ctx.ui.notify(`Flushed ${records.length} Hindsight queued record(s).`, "success");
+      } catch (error) {
+        recordFlushFailure(error);
+        ctx.ui.notify(`Hindsight flush failed; queue preserved: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("hindsight:prune-recall-messages", {
+    description: "Remove persisted hindsight-recall custom messages from the current session file (requires confirm)",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const sessionFile = ctx.sessionManager.getSessionFile?.();
+      if (!sessionFile) {
+        ctx.ui.notify("Current session is not persisted; nothing to prune.", "info");
+        return;
+      }
+      const preview = await pruneRecallMessagesInSessionFile(sessionFile);
+      if (args.trim() !== "confirm") {
+        ctx.ui.notify(`Prune preview: would remove ${preview.removed} hindsight-recall entr${preview.removed === 1 ? "y" : "ies"} from ${sessionFile}. Re-run /hindsight:prune-recall-messages confirm to rewrite the file. Malformed lines preserved: ${preview.malformed}.`, "warning");
+        return;
+      }
+      if (preview.removed === 0) {
+        ctx.ui.notify("No persisted hindsight-recall messages found in current session.", "info");
+        return;
+      }
+      const result = await pruneRecallMessagesInSessionFile(sessionFile, { write: true });
+      ctx.ui.notify(`Removed ${result.removed} persisted hindsight-recall entr${result.removed === 1 ? "y" : "ies"} from current session file.`, "success");
+    },
+  });
+
+  pi.registerCommand("hindsight:toggle-retain", {
+    description: "Toggle automatic Hindsight retention for this session",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      const entries = ctx.sessionManager.getEntries?.() ?? [];
+      const current = getHindsightMeta(entries);
+      const retained = !(current?.retained ?? true);
+      pi.appendEntry(HINDSIGHT_META_TYPE, nextMeta(entries, { retained }));
+      ctx.ui.notify(
+        retained
+          ? "Hindsight retention for this session is now enabled. If this session had retention disabled earlier, run /hindsight:parse-and-upsert-session before continuing to backfill prior turns."
+          : "Hindsight retention for this session is now disabled. New auto-retain queue entries will not be created.",
+        retained ? "success" : "warning",
+      );
+    },
+  });
+
+  pi.registerCommand("hindsight:tag", {
+    description: "Add a Hindsight tag to the current session",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const tag = args.trim();
+      if (!tag) { ctx.ui.notify("Usage: /hindsight:tag <tag>", "warning"); return; }
+      const entries = ctx.sessionManager.getEntries?.() ?? [];
+      const current = getHindsightMeta(entries) ?? { retained: true, tags: [] };
+      const tags = [...new Set([...(current.tags ?? []), tag])];
+      pi.appendEntry(HINDSIGHT_META_TYPE, nextMeta(entries, { tags }));
+      ctx.ui.notify(`Added Hindsight session tag: ${tag}`, "success");
+    },
+  });
+
+  pi.registerCommand("hindsight:remove-tag", {
+    description: "Remove a Hindsight tag from the current session",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const tag = args.trim();
+      if (!tag) { ctx.ui.notify("Usage: /hindsight:remove-tag <tag>", "warning"); return; }
+      const entries = ctx.sessionManager.getEntries?.() ?? [];
+      const current = getHindsightMeta(entries) ?? { retained: true, tags: [] };
+      const tags = (current.tags ?? []).filter((value) => value !== tag);
+      pi.appendEntry(HINDSIGHT_META_TYPE, nextMeta(entries, { tags }));
+      ctx.ui.notify(`Removed Hindsight session tag: ${tag}`, "success");
+    },
+  });
+
+  pi.registerCommand("hindsight:parse-session", {
+    description: "Parse the current Pi session to Hindsight JSON records without uploading",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      const records = parseCurrentSessionEntries(ctx);
+      ctx.ui.notify(JSON.stringify({ document_id: getSessionDocumentId(ctx), count: records.length, records }, null, 2), "info");
+    },
+  });
+
+  pi.registerCommand("hindsight:parse-and-upsert-session", {
+    description: "Parse and upsert the current Pi session to Hindsight using stable document id",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      const handles = getHandles();
+      if (!handles) { ctx.ui.notify("Hindsight is not connected. Run /hindsight:setup first.", "warning"); return; }
+      const records = parseCurrentSessionEntries(ctx);
+      const documentId = getSessionDocumentId(ctx);
+      await handles.client.retainBatch(handles.bankId, [{
+        content: JSON.stringify(records),
+        document_id: documentId,
+        update_mode: "replace",
+        context: `pi session ${documentId}`,
+        timestamp: ctx.sessionManager.getHeader?.()?.timestamp ?? new Date().toISOString(),
+        tags: ["harness:pi", `session:${documentId}`, "store_method:import"],
+      }], { async: false });
+      ctx.ui.notify(`Upserted ${records.length} parsed session record(s) to Hindsight document ${documentId}.`, "success");
+    },
+  });
+
+  pi.registerCommand("hindsight:upsert-historical-sessions", {
+    description: "Upsert persisted sessions from the current session directory (requires confirm)",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const handles = getHandles();
+      if (!handles) { ctx.ui.notify("Hindsight is not connected. Run /hindsight:setup first.", "warning"); return; }
+      const sessionDir = ctx.sessionManager.getSessionDir?.();
+      if (!sessionDir) { ctx.ui.notify("No session directory available.", "warning"); return; }
+      const files = (await readdir(sessionDir)).filter((file) => file.endsWith(".jsonl"));
+      if (args.trim() !== "confirm") {
+        ctx.ui.notify(`Historical import preview: would parse/upsert ${files.length} session file(s) from ${sessionDir}. Re-run /hindsight:upsert-historical-sessions confirm to upload.`, "warning");
+        return;
+      }
+      let uploaded = 0;
+      for (const file of files) {
+        const path = join(sessionDir, file);
+        const raw = await readFile(path, "utf8").catch(() => "");
+        const records = raw.split(/\r?\n/).flatMap((line) => {
+          if (!line.trim()) return [];
+          try {
+            const entry = JSON.parse(line);
+            return entry?.type === "message" ? [{ id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp, type: entry.type, message: entry.message }] : [];
+          } catch { return []; }
+        });
+        if (records.length === 0) continue;
+        const documentId = basename(file, ".jsonl");
+        await handles.client.retainBatch(handles.bankId, [{
+          content: JSON.stringify(records),
+          document_id: documentId,
+          update_mode: "replace",
+          context: `pi historical session ${documentId}`,
+          tags: ["harness:pi", `session:${documentId}`, "store_method:import"],
+          timestamp: records[0]?.timestamp ?? new Date().toISOString(),
+        }], { async: false });
+        uploaded += 1;
+      }
+      ctx.ui.notify(`Upserted ${uploaded}/${files.length} historical session file(s).`, "success");
+    },
+  });
+
+  pi.registerCommand("hindsight:profile", {
+    description: "Apply a Hindsight v3 setup profile: broad | project | cwd | global | isolated",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const profile = args.trim() || "project";
+      const current = await resolveConfig(ctx.cwd);
+      if (profile === "broad" || profile === "single-bank-broad") {
+        await saveConfig({ autoRecallTags: null, autoRecallTagsMatch: "any", constantTags: current.constantTags?.length ? current.constantTags : ["harness:pi"] }, { cwd: ctx.cwd, scope: "project" });
+        ctx.ui.notify("Applied broad recall profile: one bank with no recall tag filter.", "success");
+        return;
+      }
+      if (profile === "project" || profile === "single-bank-project") {
+        await saveConfig({ autoRecallTags: ["{project}"], autoRecallTagsMatch: "any_strict", observationScopes: [["{project}"]], constantTags: current.constantTags?.length ? current.constantTags : ["harness:pi"] }, { cwd: ctx.cwd, scope: "project" });
+        ctx.ui.notify("Applied project-scoped recall profile using {project} tags/scopes.", "success");
+        return;
+      }
+      if (profile === "cwd") {
+        await saveConfig({ autoRecallTags: ["{cwd}"], autoRecallTagsMatch: "any_strict", observationScopes: [["{cwd}"]], constantTags: current.constantTags?.length ? current.constantTags : ["harness:pi"] }, { cwd: ctx.cwd, scope: "project" });
+        ctx.ui.notify("Applied cwd-scoped recall profile using {cwd} tags/scopes.", "success");
+        return;
+      }
+      if (profile === "global") {
+        await saveConfig({ bankStrategy: "global", autoRecallTags: null, autoRecallTagsMatch: "any" }, { cwd: ctx.cwd, scope: "project" });
+        ctx.ui.notify("Applied global-only bank profile for this project config.", "success");
+        return;
+      }
+      if (profile === "isolated") {
+        await saveConfig({ bankStrategy: "per-repo", autoRecallTags: ["{project}"], autoRecallTagsMatch: "any_strict", observationScopes: [["{project}"]] }, { cwd: ctx.cwd, scope: "project" });
+        ctx.ui.notify("Applied hard-isolation-ish profile: per-repo bank plus project tags.", "success");
+        return;
+      }
+      ctx.ui.notify("Usage: /hindsight:profile broad|project|cwd|global|isolated", "warning");
     },
   });
 

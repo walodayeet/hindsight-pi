@@ -100,6 +100,41 @@ describe("config file resolution", () => {
     expect(projectSaved.host?.pi?.showRecallIndicator).toBe(false);
   });
 
+  it("resolves v3 object config fields", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "hindsight-pi-project-"));
+    tempDirs.push(cwd);
+    const localDir = join(cwd, ".hindsight");
+    await mkdir(localDir, { recursive: true });
+    await writeFile(join(localDir, "config.json"), JSON.stringify({
+      baseUrl: "http://localhost:8888",
+      host: { pi: {
+        enabled: true,
+        observationScopes: [["{project}"]],
+        retainContent: { assistant: ["text", "thinking"], user: ["text"], toolResult: [] },
+        strip: { topLevel: ["id"], message: ["model"] },
+        toolFilter: { toolResult: { exclude: ["grep"] } },
+      } },
+    }));
+
+    const resolved = await resolveConfig(cwd);
+    expect(resolved.observationScopes).toEqual([["{project}"]]);
+    expect(resolved.retainContent.assistant).toEqual(["text", "thinking"]);
+    expect(resolved.strip.message).toEqual(["model"]);
+    expect(resolved.toolFilter.toolResult).toEqual({ exclude: ["grep"] });
+  });
+
+  it("saves v3 config fields", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "hindsight-pi-project-"));
+    tempDirs.push(cwd);
+
+    await saveConfig({ autoRecallTags: ["{project}"], autoRecallTagsMatch: "any_strict", observationScopes: [["{project}"]], recallMaxQueryChars: 777 }, { cwd, scope: "project" });
+    const saved = JSON.parse(await readFile(join(cwd, ".hindsight", "config.json"), "utf8"));
+    expect(saved.host.pi.autoRecallTags).toEqual(["{project}"]);
+    expect(saved.host.pi.autoRecallTagsMatch).toBe("any_strict");
+    expect(saved.host.pi.observationScopes).toEqual([["{project}"]]);
+    expect(saved.host.pi.recallMaxQueryChars).toBe(777);
+  });
+
   it("defaults to manual strategy when explicit bankId exists", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "hindsight-pi-project-"));
     tempDirs.push(cwd);
