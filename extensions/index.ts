@@ -322,16 +322,26 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     const { records } = readQueueRecords(sessionId, "auto");
     if (records.length === 0) return;
     try {
-      await handles.client.retainBatch(handles.bankId, records.map((record) => ({
-        content: record.content,
-        context: record.context,
-        tags: record.tags,
-        metadata: record.metadata,
-        timestamp: record.timestamp,
-        document_id: record.document_id,
-        update_mode: record.update_mode,
-        observation_scopes: record.observation_scopes,
-      })), { async: false });
+      // Session messages legitimately share the same document_id (sessionId)
+      // because they all `update_mode: "append"` into one session document.
+      // Hindsight's retainBatch endpoint rejects any batch whose items share
+      // a document_id (race-condition guard); the @vectorize-io/hindsight-client
+      // top-level `documentId` option doesn't help either — its implementation
+      // inlines the same id into every item, which the server still rejects.
+      // Send each record as its own batch-of-1 so the dup check never fires;
+      // the append semantics into the session document are preserved.
+      for (const record of records) {
+        await handles.client.retainBatch(handles.bankId, [{
+          content: record.content,
+          context: record.context,
+          tags: record.tags,
+          metadata: record.metadata,
+          timestamp: record.timestamp,
+          document_id: record.document_id,
+          update_mode: record.update_mode,
+          observation_scopes: record.observation_scopes,
+        }], { async: false });
+      }
       deleteQueue(sessionId, "auto");
       recordFlushSuccess();
     } catch (error) {
