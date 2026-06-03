@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { appendQueueRecord, deleteQueue, readQueueRecords, queuePath } from "../extensions/queue.js";
+import { appendQueueRecord, deleteQueue, readQueueRecords, queuePath, retainQueueRecords, splitRecordsByUniqueDocumentId } from "../extensions/queue.js";
 
 let dir: string;
 let oldRoot: string | undefined;
@@ -37,5 +37,44 @@ describe("queue", () => {
     expect(read.malformed).toBe(1);
     deleteQueue("s");
     expect(readQueueRecords("s").records).toHaveLength(0);
+  });
+
+  it("splits retain batches so each batch has unique document ids", () => {
+    const records = [
+      { sessionId: "s", bankId: "b", content: "one", timestamp: "t", document_id: "doc" },
+      { sessionId: "s", bankId: "b", content: "two", timestamp: "t", document_id: "doc" },
+      { sessionId: "s", bankId: "b", content: "three", timestamp: "t", document_id: "other" },
+      { sessionId: "s", bankId: "b", content: "four", timestamp: "t", document_id: "other" },
+    ];
+
+    const batches = splitRecordsByUniqueDocumentId(records);
+
+    expect(batches.map((batch) => batch.map((record) => record.content))).toEqual([
+      ["one"],
+      ["two", "three"],
+      ["four"],
+    ]);
+    for (const batch of batches) {
+      const ids = batch.map((record) => record.document_id).filter(Boolean);
+      expect(new Set(ids).size).toBe(ids.length);
+    }
+  });
+
+  it("flushes duplicate document ids through separate retainBatch calls", async () => {
+    const calls: Array<{ bankId: string; items: Array<Record<string, unknown>>; options: Record<string, unknown> }> = [];
+    const client = {
+      retainBatch: async (bankId: string, items: Array<Record<string, unknown>>, options: Record<string, unknown>) => {
+        calls.push({ bankId, items, options });
+      },
+    };
+
+    await retainQueueRecords(client, "bank", [
+      { sessionId: "s", bankId: "bank", content: "one", timestamp: "t", document_id: "doc", update_mode: "append" },
+      { sessionId: "s", bankId: "bank", content: "two", timestamp: "t", document_id: "doc", update_mode: "append" },
+    ]);
+
+    expect(calls).toHaveLength(2);
+    expect(calls.map((call) => call.items.map((item) => item.document_id))).toEqual([["doc"], ["doc"]]);
+    expect(calls.every((call) => call.options.async === false)).toBe(true);
   });
 });

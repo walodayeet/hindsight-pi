@@ -24,7 +24,7 @@ import { getSessionDocumentId, parseCurrentSessionEntries } from "./session-docu
 import { getHookStats } from "./hooks.js";
 import { HINDSIGHT_META_TYPE, getHindsightMeta, nextMeta } from "./meta.js";
 import { pruneRecallMessagesInSessionFile } from "./prune.js";
-import { deleteQueue, readQueueRecords } from "./queue.js";
+import { deleteQueue, readQueueRecords, retainQueueRecords } from "./queue.js";
 
 const mask = (value?: string): string => (value ? `${value.slice(0, 6)}...redacted` : "(none)");
 const parseCsv = (value: string | undefined): string[] => (value ?? "").split(",").map((v) => v.trim()).filter(Boolean);
@@ -731,16 +731,7 @@ export const registerCommands = (pi: ExtensionAPI): void => {
         return;
       }
       try {
-        await handles.client.retainBatch(handles.bankId, records.map((record) => ({
-          content: record.content,
-          context: record.context,
-          tags: record.tags,
-          metadata: record.metadata,
-          timestamp: record.timestamp,
-          document_id: record.document_id,
-          update_mode: record.update_mode,
-          observation_scopes: record.observation_scopes,
-        })), { async: false });
+        await retainQueueRecords(handles.client, handles.bankId, records);
         deleteQueue(sessionId, "auto");
         recordFlushSuccess();
         ctx.ui.notify(`Flushed ${records.length} Hindsight queued record(s).`, "success");
