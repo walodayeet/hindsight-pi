@@ -315,14 +315,23 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
     }
   });
 
-  const flushQueuedSession = async (ctx: any): Promise<void> => {
-    const handles = getHandles();
-    if (!handles) return;
-    const sessionId = getSessionDocumentId(ctx);
-    const { records } = readQueueRecords(sessionId, "auto");
-    if (records.length === 0) return;
-    try {
-      await handles.client.retainBatch(handles.bankId, records.map((record) => ({
+  // Hindsight rejects a retainBatch whose items share a document_id
+  // ("Batch contains duplicate document_ids ... Each content item in a batch
+  // must have a unique document_id to avoid race conditions"). The auto queue
+  // appends one record per message, all targeting the stable session document,
+  // so flushing a session with more than one queued message always tripped
+  // this and the whole flush was lost. Merge same-document records into one
+  // append: contents joined in queue order (JSONL), remaining fields from the
+  // first record (they are identical within a session's queue).
+  const mergeRecordsByDocument = (records: Array<Record<string, any>>) => {
+    const merged = new Map<string, Record<string, any>>();
+    for (const record of records) {
+      const existing = merged.get(record.document_id);
+      if (existing) {
+        existing.content = `${existing.content}\n${record.content}`;
+        continue;
+      }
+      merged.set(record.document_id, {
         content: record.content,
         context: record.context,
         tags: record.tags,
@@ -331,7 +340,19 @@ export default function hindsightMemory(pi: ExtensionAPI): void {
         document_id: record.document_id,
         update_mode: record.update_mode,
         observation_scopes: record.observation_scopes,
-      })), { async: false });
+      });
+    }
+    return [...merged.values()];
+  };
+
+  const flushQueuedSession = async (ctx: any): Promise<void> => {
+    const handles = getHandles();
+    if (!handles) return;
+    const sessionId = getSessionDocumentId(ctx);
+    const { records } = readQueueRecords(sessionId, "auto");
+    if (records.length === 0) return;
+    try {
+      await handles.client.retainBatch(handles.bankId, mergeRecordsByDocument(records), { async: false });
       deleteQueue(sessionId, "auto");
       recordFlushSuccess();
     } catch (error) {
